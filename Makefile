@@ -1,6 +1,7 @@
 COMPOSE := docker compose -f infra/docker-compose.yml --env-file .env
 PYTHON ?= .venv/bin/python
 COUNT ?= 1000
+BATCH_SIZE ?= 200
 
 .DEFAULT_GOAL := help
 .PHONY: help up down clean ps logs register-connector generate generate-forever consume test
@@ -33,8 +34,8 @@ generate: ## Write COUNT synthetic events into source Postgres (make generate CO
 generate-forever: ## Keep writing events until Ctrl+C
 	PYTHONPATH=. $(PYTHON) ingestion/producer/db_writer.py --forever
 
-consume: ## Consume Kafka topic into RustFS batches (runs until Ctrl+C)
-	PYTHONPATH=. $(PYTHON) ingestion/consumer/kafka_to_rustfs.py
+consume: ## Consume Kafka topic into RustFS batches (runs until Ctrl+C; make consume BATCH_SIZE=50)
+	PYTHONPATH=. $(PYTHON) ingestion/consumer/kafka_to_rustfs.py --batch-size $(BATCH_SIZE)
 
 test: ## Run the test suite
 	PYTHONPATH=. $(PYTHON) -m pytest -q
