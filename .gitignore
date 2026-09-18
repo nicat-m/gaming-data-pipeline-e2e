@@ -1,0 +1,46 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# dbt
+transformation/dbt_gaming/target/
+transformation/dbt_gaming/dbt_packages/
+transformation/dbt_gaming/logs/
+transformation/dbt_gaming/.user.yml
+
+# Airflow
+infra/airflow/logs/
+infra/airflow/airflow.cfg
+infra/airflow/airflow.db
+orchestration/logs/
+
+# Docker / infra state
+infra/volumes/
+infra/rustfs-data/
+infra/kafka-data/
+infra/postgres-data/
+
+# Data (never commit raw/generated data)
+data/
+*.csv
+*.parquet
+!tests/**/*.csv
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
