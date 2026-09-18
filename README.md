@@ -34,7 +34,8 @@ Full component-by-component walkthrough: `docs/PROJECT_PLAN.md`, section 3.
 | Source database | PostgreSQL 16.4 (`wal_level=logical`) |
 | Change data capture | Kafka Connect + Debezium PostgreSQL connector 2.7.3 |
 | Streaming backbone | Apache Kafka 3.8.0 (KRaft mode) |
-| Raw object storage | RustFS 1.0.1 (S3-compatible) |
+| Kafka observability | Kafka UI (Provectus) 0.7.2 |
+| Raw object storage | RustFS 1.0.0 (S3-compatible) |
 | Warehouse | PostgreSQL 16.4 (separate instance) |
 | Transformation (dims/facts) | dbt-core 1.8.7 / dbt-postgres |
 | Batch processing (aggregates) | Apache Spark 3.5.3 (standalone master+worker) |
@@ -58,8 +59,8 @@ cp .env.example .env
 # Edit .env and replace every <CHANGE_ME> — .env.example documents how to
 # generate each value (Fernet key, secret key, etc.). Never commit .env.
 
-docker compose -f infra/docker-compose.yml up -d
-docker compose -f infra/docker-compose.yml ps   # wait for all services "healthy"
+docker compose -f infra/docker-compose.yml --env-file .env up -d
+docker compose -f infra/docker-compose.yml --env-file .env ps   # wait for all services "healthy"
 
 # Register the Debezium PostgreSQL source connector (one-time, after the stack is healthy)
 set -a && source .env && set +a
@@ -70,6 +71,7 @@ set -a && source .env && set +a
 - RustFS console: http://localhost:9001
 - Spark master UI: http://localhost:8081
 - Kafka Connect REST API: http://localhost:8083
+- Kafka UI: http://localhost:8085
 - Postgres (source): `localhost:5433`, database from `SOURCE_POSTGRES_DB`
 - Postgres (warehouse): `localhost:5432`, database from `POSTGRES_DB`
 - Kafka broker: `localhost:9092`
@@ -86,13 +88,13 @@ PYTHONPATH=. pytest -q
 
 ```bash
 # Stop, keep data (named volumes persist)
-docker compose -f infra/docker-compose.yml down
+docker compose -f infra/docker-compose.yml --env-file .env down
 
 # Restart — state (both Postgres instances, Kafka log, RustFS objects) survives
-docker compose -f infra/docker-compose.yml up -d
+docker compose -f infra/docker-compose.yml --env-file .env up -d
 
 # Full reset — deletes all volumes/state
-docker compose -f infra/docker-compose.yml down -v
+docker compose -f infra/docker-compose.yml --env-file .env down -v
 ```
 
 ## Project Structure

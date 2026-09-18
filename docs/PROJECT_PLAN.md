@@ -137,10 +137,11 @@ flowchart LR
 | Source database | PostgreSQL 16.4 (`postgres-source` service, `wal_level=logical`) | Models a realistic OLTP write path for the generator, and exposes a logical replication slot for CDC | Generator publishing to Kafka directly (skips the realistic "source system" stage entirely) |
 | Change data capture | **Kafka Connect + Debezium PostgreSQL connector** (`debezium/connect:2.7.3.Final`) | Standard pattern for "database as the source of truth, stream as the ingestion mechanism"; captures every insert via WAL without touching application code | A custom polling script (reinvents CDC, no schema/offset management, easy to lose events) |
 | Streaming backbone | Apache Kafka (`apache/kafka:3.8.0`, KRaft mode) | Durable, replayable buffer between Debezium and the raw-storage writer; standard pairing with Kafka Connect | Direct file drop (no replay, no backpressure handling) |
-| Raw object storage (landing zone) | **RustFS** (`rustfs/rustfs:1.0.1`) | S3-compatible, single lightweight Rust binary, trivial to run in Docker Compose, gives a real data-lake landing zone before the warehouse | MinIO (functionally similar; RustFS chosen per project scope to use a different S3-compatible engine); local filesystem (no S3 API, not realistic) |
+| Kafka observability | Kafka UI (`provectuslabs/kafka-ui:v0.7.2`) | Local-only UI to inspect topics, messages, consumer groups, and the Kafka Connect connector status while developing/debugging; no impact on the pipeline itself | CLI-only (`kafka-console-consumer`, Connect REST calls); works but slower to iterate with |
+| Raw object storage (landing zone) | **RustFS** (`rustfs/rustfs:1.0.0`) | S3-compatible, single lightweight Rust binary, trivial to run in Docker Compose, gives a real data-lake landing zone before the warehouse | MinIO (functionally similar; RustFS chosen per project scope to use a different S3-compatible engine); local filesystem (no S3 API, not realistic) |
 | Warehouse | PostgreSQL 16.4 (separate instance from the source database) | SQL-based transformation target, widely supported by dbt, easy to run and inspect locally | DuckDB (weaker multi-user/concurrent access story for a pipeline with Airflow + dbt both connecting) |
 | Transformation (dims/facts) | dbt-core 1.8.7 + dbt-postgres | Staging → curated layering with built-in tests, docs, and lineage; industry-standard for this exact pattern | Hand-written SQL scripts run by Airflow (no built-in testing/docs, harder to maintain) |
-| Batch processing (aggregates) | **Apache Spark** (`bitnami/spark:3.5.3`, standalone master+worker) | Reads raw NDJSON directly from RustFS (S3A) and computes `agg_player_daily_engagement`; gives the platform a genuine distributed batch-compute engine that scales past what row-by-row SQL handles well, and satisfies the requirement to demonstrate batch processing explicitly | Doing the same aggregate in dbt/SQL (works at this data volume, but doesn't demonstrate a distributed batch-processing engine, which is the point of adding this component) |
+| Batch processing (aggregates) | **Apache Spark** (`bitnamilegacy/spark:3.5.3`, standalone master+worker — Bitnami moved versioned tags to the `bitnamilegacy` registry namespace in August 2025) | Reads raw NDJSON directly from RustFS (S3A) and computes `agg_player_daily_engagement`; gives the platform a genuine distributed batch-compute engine that scales past what row-by-row SQL handles well, and satisfies the requirement to demonstrate batch processing explicitly | Doing the same aggregate in dbt/SQL (works at this data volume, but doesn't demonstrate a distributed batch-processing engine, which is the point of adding this component) |
 | Orchestration | Apache Airflow 2.10.2 | DAG-based scheduling, task-level retries, clear dependency graph between load/staging/curated/spark steps | Cron + shell scripts (no dependency graph, no UI, no built-in retry semantics) |
 | Data quality | dbt built-in tests (`not_null`, `unique`, `relationships`, `accepted_values`) | Declared alongside the models they test, runs as part of `dbt test`, no extra service | Great Expectations (a second DQ framework — not justified given dbt tests already cover the required checks) |
 | Containerization | Docker Compose | Single-command, reproducible local infra for every service above | Manual per-service install (not reproducible, fails the Phase 0 "single command" requirement) |
@@ -268,7 +269,7 @@ add as an explicit Airflow task between staging and curated.
 | Risk / assumption | Mitigation |
 |---|---|
 | RustFS, Kafka Connect/Debezium, and/or Spark may exceed the "one new tool" allowance if not covered by the course | Flagged explicitly in Section 4; will confirm with instructor before Phase 1 which additions are acceptable and fall back (e.g. a JDBC polling script instead of Debezium, or a dbt/SQL aggregate instead of Spark) if disallowed |
-| RustFS is a newer project with a smaller community than MinIO; fewer references for troubleshooting | Pinned to a specific tag (`1.0.1`); S3 API compatibility means the consumer/Spark code only depends on `boto3`/S3A, so swapping back to MinIO would be a config-only change if RustFS proves unstable |
+| RustFS is a newer project with a smaller community than MinIO; fewer references for troubleshooting | Pinned to a specific tag (`1.0.0`); S3 API compatibility means the consumer/Spark code only depends on `boto3`/S3A, so swapping back to MinIO would be a config-only change if RustFS proves unstable |
 | Debezium requires `wal_level=logical` and a dedicated replication slot; misconfiguration silently stalls CDC | `postgres-source` sets `wal_level=logical` explicitly in Compose; Phase 1 will add a health check on the connector's `/status` endpoint, not just container health |
 | Running Spark (master+worker) alongside Airflow, 2x Postgres, Kafka, Kafka Connect, and RustFS is a heavy footprint for a laptop | Spark worker capped to 1 core / 1 GB; all images pinned and lightweight where possible; documented as a known resource trade-off in the README prerequisites |
 | Synthetic data may not convincingly resemble real telemetry volume/shape | Generator parameters (`GENERATOR_*` env vars) are tunable; Faker-based realistic player/device attributes; dirty/drift rates documented and adjustable |
@@ -286,15 +287,16 @@ cp .env.example .env
 # for how to generate each one)
 
 # 2. Start infrastructure
-docker compose -f infra/docker-compose.yml up -d
+docker compose -f infra/docker-compose.yml --env-file .env up -d
 
 # 3. Check every service is healthy
-docker compose -f infra/docker-compose.yml ps
+docker compose -f infra/docker-compose.yml --env-file .env ps
 
 # 4. Airflow UI: http://localhost:8080 (login: AIRFLOW_ADMIN_USER / AIRFLOW_ADMIN_PASSWORD from .env)
 # RustFS console: http://localhost:9001
 # Spark master UI: http://localhost:8081
 # Kafka Connect REST API: http://localhost:8083
+# Kafka UI: http://localhost:8085
 
 # 5. Register the Debezium PostgreSQL source connector (one-time, after the stack is healthy)
 set -a && source .env && set +a
@@ -312,8 +314,8 @@ PYTHONPATH=. python -m ingestion.producer.db_writer --count 50
 PYTHONPATH=. python -m ingestion.consumer.kafka_to_rustfs --batch-size 50 --max-batches 1
 
 # 9. Stop infrastructure (state persists in named Docker volumes)
-docker compose -f infra/docker-compose.yml down
+docker compose -f infra/docker-compose.yml --env-file .env down
 
 # 10. Full reset (drops all volumes/state)
-docker compose -f infra/docker-compose.yml down -v
+docker compose -f infra/docker-compose.yml --env-file .env down -v
 ```
