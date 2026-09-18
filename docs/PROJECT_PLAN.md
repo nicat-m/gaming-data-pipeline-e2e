@@ -280,7 +280,7 @@ Prerequisites: Docker + Docker Compose v2, Python 3.11+.
 
 ```bash
 # 1. Clone and configure
-git clone <repo-url> && cd data-engineer-e2e-task
+git clone <repo-url> && cd gaming-data-pipeline-e2e
 cp .env.example .env
 # edit .env: set real values for every <CHANGE_ME> (see comments in the file
 # for how to generate each one)

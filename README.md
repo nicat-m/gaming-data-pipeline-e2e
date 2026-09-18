@@ -53,7 +53,7 @@ Full justification and rejected alternatives: `docs/PROJECT_PLAN.md`, section 4.
 ## Setup
 
 ```bash
-git clone <repo-url> && cd data-engineer-e2e-task
+git clone <repo-url> && cd gaming-data-pipeline-e2e
 cp .env.example .env
 # Edit .env and replace every <CHANGE_ME> — .env.example documents how to
 # generate each value (Fernet key, secret key, etc.). Never commit .env.
