@@ -1,0 +1,23 @@
+{
+  "name": "gaming-postgres-source-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres-source",
+    "database.port": "5432",
+    "database.user": "${SOURCE_POSTGRES_USER}",
+    "database.password": "${SOURCE_POSTGRES_PASSWORD}",
+    "database.dbname": "${SOURCE_POSTGRES_DB}",
+    "topic.prefix": "gaming",
+    "schema.include.list": "source",
+    "table.include.list": "source.game_events",
+    "plugin.name": "pgoutput",
+    "slot.name": "gaming_debezium_slot",
+    "publication.autocreate.mode": "filtered",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false",
+    "topic.creation.default.partitions": "1",
+    "topic.creation.default.replication.factor": "1"
+  }
+}

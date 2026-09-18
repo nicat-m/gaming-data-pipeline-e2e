@@ -16,6 +16,8 @@ x-airflow-common: &airflow-common
     RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY}
     RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY}
     RUSTFS_RAW_BUCKET: ${RUSTFS_RAW_BUCKET}
+    SPARK_MASTER_URL: spark://spark-master:7077
+    AIRFLOW_CONN_SOURCE_POSTGRES: postgresql://${SOURCE_POSTGRES_USER}:${SOURCE_POSTGRES_PASSWORD}@postgres-source:5432/${SOURCE_POSTGRES_DB}
   volumes:
     - ../orchestration/dags:/opt/airflow/dags
     - ../ingestion:/opt/airflow/ingestion
@@ -29,6 +31,27 @@ x-airflow-common: &airflow-common
     - gaming-net
 
 services:
+  postgres-source:
+    image: postgres:16.4
+    container_name: gaming-postgres-source
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=4", "-c", "max_wal_senders=4"]
+    environment:
+      POSTGRES_USER: ${SOURCE_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${SOURCE_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${SOURCE_POSTGRES_DB}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-source-data:/var/lib/postgresql/data
+      - ./postgres-source/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SOURCE_POSTGRES_USER} -d ${SOURCE_POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - gaming-net
+
   postgres:
     image: postgres:16.4
     container_name: gaming-postgres
@@ -90,6 +113,70 @@ services:
       interval: 10s
       timeout: 10s
       retries: 15
+    networks:
+      - gaming-net
+
+  kafka-connect:
+    image: debezium/connect:2.7.3.Final
+    container_name: gaming-kafka-connect
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:19092
+      GROUP_ID: gaming-connect-cluster
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres-source:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8083/connectors || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+    networks:
+      - gaming-net
+
+  spark-master:
+    image: bitnami/spark:3.5.3
+    container_name: gaming-spark-master
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+    ports:
+      - "7077:7077"
+      - "8081:8080"
+    volumes:
+      - ../transformation/spark_jobs:/opt/spark-apps
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    networks:
+      - gaming-net
+
+  spark-worker:
+    image: bitnami/spark:3.5.3
+    container_name: gaming-spark-worker
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 1G
+      SPARK_WORKER_CORES: 1
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+    volumes:
+      - ../transformation/spark_jobs:/opt/spark-apps
+    depends_on:
+      spark-master:
+        condition: service_healthy
     networks:
       - gaming-net
 
@@ -161,6 +248,7 @@ networks:
     driver: bridge
 
 volumes:
+  postgres-source-data:
   postgres-data:
   postgres-airflow-data:
   kafka-data:

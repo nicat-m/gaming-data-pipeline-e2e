@@ -31,6 +31,36 @@ class PostgresSettings(BaseModel):
         )
 
 
+class SourcePostgresSettings(BaseModel):
+    """The OLTP-style source database the generator writes into directly.
+
+    Debezium (Kafka Connect) reads this database's WAL via logical
+    replication and streams inserts onto the Kafka topic - nothing else
+    reads from or writes to this database.
+    """
+
+    user: str = os.getenv("SOURCE_POSTGRES_USER", "source_app")
+    password: str = os.getenv("SOURCE_POSTGRES_PASSWORD", "")
+    db: str = os.getenv("SOURCE_POSTGRES_DB", "gaming_source")
+    host: str = os.getenv("SOURCE_POSTGRES_HOST", "localhost")
+    port: int = int(os.getenv("SOURCE_POSTGRES_PORT", "5433"))
+
+    @property
+    def dsn(self) -> str:
+        return (
+            f"postgresql://{self.user}:{self.password}"
+            f"@{self.host}:{self.port}/{self.db}"
+        )
+
+
+class KafkaConnectSettings(BaseModel):
+    url: str = os.getenv("KAFKA_CONNECT_URL", "http://localhost:8083")
+
+
+class SparkSettings(BaseModel):
+    master_url: str = os.getenv("SPARK_MASTER_URL", "spark://localhost:7077")
+
+
 class KafkaSettings(BaseModel):
     bootstrap_servers: str = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
     topic_game_events: str = os.getenv("KAFKA_TOPIC_GAME_EVENTS", "game_events")
@@ -51,7 +81,10 @@ class GeneratorSettings(BaseModel):
 
 class Settings(BaseModel):
     postgres: PostgresSettings = PostgresSettings()
+    source_postgres: SourcePostgresSettings = SourcePostgresSettings()
     kafka: KafkaSettings = KafkaSettings()
+    kafka_connect: KafkaConnectSettings = KafkaConnectSettings()
+    spark: SparkSettings = SparkSettings()
     rustfs: RustFSSettings = RustFSSettings()
     generator: GeneratorSettings = GeneratorSettings()
 
