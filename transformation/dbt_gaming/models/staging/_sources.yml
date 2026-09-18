@@ -1,0 +1,13 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: raw
+    description: >
+      As-landed data loaded from the RustFS raw bucket by the Airflow
+      "load_raw_to_postgres" task. Populated starting Phase 1 (ingestion);
+      this definition exists in Phase 0 so the dbt project has a real
+      source to compile against.
+    tables:
+      - name: game_events
+        description: One row per raw Kafka game event, loaded as-is (no cleaning).

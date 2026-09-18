@@ -1,0 +1,5 @@
+version: 2
+
+models:
+  - name: stg_game_events
+    description: Phase 0 passthrough of raw.game_events. Tests/columns land in Phase 1.

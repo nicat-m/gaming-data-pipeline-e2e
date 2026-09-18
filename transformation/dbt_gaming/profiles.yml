@@ -1,0 +1,17 @@
+# Safe to commit: every value is read from an environment variable at
+# runtime via env_var(), no secret literal appears in this file.
+# Point DBT_PROFILES_DIR at this directory to use it, e.g.:
+#   export DBT_PROFILES_DIR=$(pwd)/transformation/dbt_gaming
+
+dbt_gaming:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('POSTGRES_HOST', 'localhost') }}"
+      port: "{{ env_var('POSTGRES_PORT', '5432') | as_number }}"
+      user: "{{ env_var('POSTGRES_USER') }}"
+      password: "{{ env_var('POSTGRES_PASSWORD') }}"
+      dbname: "{{ env_var('POSTGRES_DB') }}"
+      schema: staging
+      threads: 4
