@@ -1,10 +1,19 @@
 """
 Phase 0 skeleton DAG for the Gaming Lakehouse pipeline.
 
-Defines the shape of the pipeline (RustFS -> Postgres raw -> dbt staging ->
-dbt curated) so the orchestration layer is provable end-to-end from day
-one. Task bodies are placeholders on purpose - no business logic ships
-until Phase 1 (ingestion/storage) and Phase 2 (transformation).
+Defines the shape of the pipeline so the orchestration layer is provable
+end-to-end from day one:
+
+    load_raw_to_postgres --> dbt_run_staging --> dbt_run_curated
+                                              \-> spark_batch_daily_engagement
+
+Note the generator and Kafka are NOT orchestrated by this DAG: events flow
+generator -> source Postgres -> Debezium (Kafka Connect, CDC) -> Kafka ->
+consumer -> RustFS continuously and independently. This DAG only owns the
+batch steps from RustFS onward. Task bodies are placeholders on purpose -
+no business logic ships until Phase 1 (ingestion/storage), Phase 2
+(transformation), and Phase 3 (Spark aggregation), per
+docs/PROJECT_PLAN.md.
 
 The DAG is created paused (AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION) so
 it never runs unattended before its task logic is implemented.
@@ -34,7 +43,10 @@ def load_raw_to_postgres(**_context) -> None:
 
 with DAG(
     dag_id="gaming_pipeline",
-    description="Kafka -> RustFS -> Postgres raw -> dbt staging -> dbt curated",
+    description=(
+        "Postgres(source) -> Debezium/Kafka -> RustFS -> Postgres(raw) "
+        "-> dbt staging/curated + Spark batch aggregation"
+    ),
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
@@ -63,4 +75,14 @@ with DAG(
         ),
     )
 
+    spark_batch_daily_engagement = BashOperator(
+        task_id="spark_batch_daily_engagement",
+        bash_command=(
+            "spark-submit --master {{ var.value.get('spark_master_url', 'spark://spark-master:7077') }} "
+            "/opt/airflow/transformation/spark_jobs/daily_engagement_batch.py "
+            "--date {{ ds }}"
+        ),
+    )
+
     load_raw >> dbt_run_staging >> dbt_run_curated
+    load_raw >> spark_batch_daily_engagement
