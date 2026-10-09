@@ -56,9 +56,16 @@ with app.app_context():
             )
             db.session.add(ds)
             db.session.flush()
+            ds.fetch_metadata()  # pull real columns from ClickHouse
+            db.session.flush()
             print(f"dataset created: {schema}.{table}")
         else:
-            print(f"dataset exists:  {schema}.{table}")
+            if not ds.columns:
+                ds.fetch_metadata()
+                db.session.flush()
+                print(f"dataset re-synced: {schema}.{table} (was stale/empty)")
+            else:
+                print(f"dataset exists:  {schema}.{table}")
         datasets[f"{schema}.{table}"] = ds
 
     # ------------------------------------------------------------------ charts

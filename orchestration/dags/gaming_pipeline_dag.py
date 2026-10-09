@@ -225,14 +225,14 @@ def publish_serving(partition_date: str, **_context) -> None:
     view_sql = """
     CREATE OR REPLACE VIEW serving.v_player_engagement_daily AS
     SELECT
-        p.player_id,
-        p.country,
+        f.player_id              AS player_id,
+        p.country                AS country,
         count(f.event_id)        AS transactions,
         sum(f.amount_usd)        AS total_amount_usd,
         max(f.event_time)        AS last_txn_at
     FROM curated.fct_in_game_transaction f
     JOIN curated.dim_player p USING (player_id)
-    GROUP BY p.player_id, p.country
+    GROUP BY f.player_id, p.country
     """
     client = _get_clickhouse_client()
     client.command("CREATE DATABASE IF NOT EXISTS serving")
