@@ -17,6 +17,29 @@ marketing investment. Concretely, the curated `agg_player_daily_engagement`
 and `fct_in_game_transaction` models feed a weekly review where Growth
 decides campaign budget allocation per game/segment.
 
+### 1.1 Business value (why a business would fund this)
+
+The pipeline itself is infrastructure; the value is in the decisions it
+makes cheaper and faster than the status quo (manual SQL over production
+databases, spreadsheet exports, gut feeling):
+
+- **Revenue lens on engagement.** Joining sessions (free behavior) with
+  `in_game_transaction` (money) in one curated model answers "which
+  segments/titles pay" without the analyst stitching three systems.
+- **Early churn detection.** `agg_player_daily_engagement` shows per-player
+  daily activity; a segment whose session count drops off right after
+  `session_start → repeat play` is a retention-campaign target while it can
+  still be saved — before it is gone.
+- **Budget allocation with evidence.** The weekly Growth review allocates
+  campaign spend per game title / player segment from the same tables the
+  finance numbers reconcile to, not from ad-hoc extracts.
+- **One trusted copy of player truth.** Raw is append-only, curated is
+  tested (dbt), so product/finance/marketing all read the same
+  `player_id`-keyed numbers instead of three versions of "DAU".
+- **Cheaper iteration on new questions.** Once CDC streams every event,
+  a new question ("do ab_test_cohort users transact more?") is a new dbt
+  model over existing history — not a new backfill project.
+
 **Reference data model:** the entity set (`player`, `game_title`, `device`,
 `game_session`, `in_game_transaction`, `campaign`) is a deliberately reduced
 subset of the **Gaming** industry model published in
@@ -138,8 +161,9 @@ flowchart LR
 | Change data capture | **Kafka Connect + Debezium PostgreSQL connector** (`debezium/connect:2.7.3.Final`) | Standard pattern for "database as the source of truth, stream as the ingestion mechanism"; captures every insert via WAL without touching application code | A custom polling script (reinvents CDC, no schema/offset management, easy to lose events) |
 | Streaming backbone | Apache Kafka (`apache/kafka:3.8.0`, KRaft mode) | Durable, replayable buffer between Debezium and the raw-storage writer; standard pairing with Kafka Connect | Direct file drop (no replay, no backpressure handling) |
 | Kafka observability | Kafka UI (`provectuslabs/kafka-ui:v0.7.2`) | Local-only UI to inspect topics, messages, consumer groups, and the Kafka Connect connector status while developing/debugging; no impact on the pipeline itself | CLI-only (`kafka-console-consumer`, Connect REST calls); works but slower to iterate with |
-| Raw object storage (landing zone) | **RustFS** (`rustfs/rustfs:1.0.0`) | S3-compatible, single lightweight Rust binary, trivial to run in Docker Compose, gives a real data-lake landing zone before the warehouse | MinIO (functionally similar; RustFS chosen per project scope to use a different S3-compatible engine); local filesystem (no S3 API, not realistic) |
+| Raw object storage (landing zone) | **RustFS** (`rustfs/rustfs:1.0.0`) | S3-compatible, single lightweight Rust binary, trivial to run in Docker Compose, gives a real data-lake landing zone before the warehouse | HDFS (needs JVM NameNode/DataNode daemons, a cluster-aware setup, and the Hadoop ecosystem — disproportionate for a laptop Docker Compose stack; modern compute engines read object storage via S3A natively, so the data-lake role no longer requires HDFS); MinIO (functionally similar; RustFS chosen per project scope to use a different S3-compatible engine); local filesystem (no S3 API, not realistic) |
 | Warehouse | PostgreSQL 16.4 (separate instance from the source database) | SQL-based transformation target, widely supported by dbt, easy to run and inspect locally | DuckDB (weaker multi-user/concurrent access story for a pipeline with Airflow + dbt both connecting) |
+| Kafka → raw landing | Custom Python consumer (`ingestion/consumer/kafka_to_rustfs.py`), orchestrated by Airflow in Phase 1+ | Full control over the raw object naming (offset-range keys → idempotent reloads) and over how dirty records are handled; runs anywhere Python runs, no extra image build | Kafka Connect S3 sink plugin (managed offsets/retries are attractive, but the plugin is not bundled in the `debezium/connect` image — needs a custom Dockerfile and jar download, imposes its own topic/partition file layout, and flush-by-size conflicts with per-logical-date raw partitions; revisit as an ADR if raw landing volume outgrows the consumer) |
 | Transformation (dims/facts) | dbt-core 1.8.7 + dbt-postgres | Staging → curated layering with built-in tests, docs, and lineage; industry-standard for this exact pattern | Hand-written SQL scripts run by Airflow (no built-in testing/docs, harder to maintain) |
 | Batch processing (aggregates) | **Apache Spark** (`bitnamilegacy/spark:3.5.3`, standalone master+worker — Bitnami moved versioned tags to the `bitnamilegacy` registry namespace in August 2025) | Reads raw NDJSON directly from RustFS (S3A) and computes `agg_player_daily_engagement`; gives the platform a genuine distributed batch-compute engine that scales past what row-by-row SQL handles well, and satisfies the requirement to demonstrate batch processing explicitly | Doing the same aggregate in dbt/SQL (works at this data volume, but doesn't demonstrate a distributed batch-processing engine, which is the point of adding this component) |
 | Orchestration | Apache Airflow 2.10.2 | DAG-based scheduling, task-level retries, clear dependency graph between load/staging/curated/spark steps | Cron + shell scripts (no dependency graph, no UI, no built-in retry semantics) |
@@ -319,3 +343,19 @@ docker compose -f infra/docker-compose.yml --env-file .env down
 # 10. Full reset (drops all volumes/state)
 docker compose -f infra/docker-compose.yml --env-file .env down -v
 ```
+
+## Changelog
+
+- **2026-10-09 — Phase 1 (walking skeleton):** the batch slice
+  (Kafka → RustFS → raw → staging → curated → serving) is now implemented
+  and orchestrated by Airflow (`gaming_pipeline` DAG): logical-date
+  parameterised, idempotent re-runs (offset-range raw keys + ON CONFLICT
+  upsert + full-refresh tables), 4 dbt DQ checks as a run-failing gate,
+  serving SQL view + CSV report, deliberate-failure switch
+  (`PIPELINE_FAIL_SWITCH`), one-command smoke test (`make smoke`), CI
+  (ruff + compile + compose validation). Spark's real S3A batch job is
+  deferred to Phase 3 and covered by a connectivity proof instead —
+  see ADR `docs/decisions/0001-spark-batch-s3a-phase3.md`. Kafka→RustFS
+  landing stays a custom consumer (orchestrated by Airflow in Phase 1+);
+  the Kafka Connect S3 sink alternative is documented in the tech-stack
+  table. Business-value framing added as section 1.1.

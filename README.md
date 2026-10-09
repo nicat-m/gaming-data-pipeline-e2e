@@ -9,21 +9,36 @@ problem statement, data model, and phase roadmap.
 
 ## Architecture
 
+✅ = implemented in Phase 1 · 📋 = planned (later phase)
+
 ```mermaid
 flowchart LR
-    GEN[Python generator] -->|INSERT| PGSRC[(Postgres source)]
-    PGSRC -->|logical replication| CONNECT[Kafka Connect: Debezium]
-    CONNECT -->|publish| KAFKA[(Kafka: gaming.source.game_events)]
-    KAFKA -->|consume| CONSUMER[Kafka consumer]
-    CONSUMER -->|NDJSON batches| RUSTFS[(RustFS raw landing zone)]
-    AF[Airflow DAG] --> RUSTFS
-    AF --> PGRAW[(Postgres: raw)]
-    PGRAW --> STG[dbt staging models]
-    STG --> CUR[dbt curated: dims + facts]
-    RUSTFS --> SPARK[Spark batch job]
-    SPARK -->|JDBC| CUR
-    CUR --> VIEWS[SQL serving views]
+    GEN[Python generator ✅] -->|INSERT| PGSRC[(Postgres source ✅)]
+    PGSRC -->|logical replication| CONNECT[Kafka Connect: Debezium ✅]
+    CONNECT -->|publish| KAFKA[(Kafka topic ✅)]
+    KAFKA -->|consume, in Airflow| CONSUMER[Kafka consumer ✅]
+    CONSUMER -->|NDJSON batches| RUSTFS[(RustFS raw zone ✅)]
+    AF[Airflow DAG ✅] --> PGRAW[(Postgres: raw ✅)]
+    PGRAW --> STG[dbt staging ✅]
+    STG -->|dbt tests ✅ DQ gate| CUR[dbt curated: dim + fact ✅]
+    RUSTFS -.->|S3A read| SPARK[Spark batch job 📋 Phase 3]
+    SPARK -.->|JDBC| CUR
+    CUR --> VIEWS[Serving: SQL view + CSV report ✅]
 ```
+
+Component roles (pipeline ↔ component mapping):
+
+| Pipeline role | Component |
+|---|---|
+| Source system | Python generator → source Postgres (`source.game_events`) |
+| Ingestion / CDC | Debezium (Kafka Connect) streaming into Kafka |
+| Streaming buffer | Kafka topic `gaming.source.game_events` |
+| Raw landing zone | RustFS bucket (`raw/game_events/dt=<date>/`) — orchestrated consumer task |
+| Warehouse (raw/staging/curated) | Postgres + dbt (tests act as the DQ gate) |
+| Batch compute | Spark — connectivity proof now, real S3A job in Phase 3 (ADR 0001) |
+| Orchestration | Airflow `gaming_pipeline` DAG (logical-date parameterised) |
+| Serving | `serving.v_player_engagement_daily` SQL view + CSV report on RustFS |
+| Consumer | Product/Growth team — any SQL client/BI tool; reproducible via repo init SQL |
 
 Full component-by-component walkthrough: `docs/PROJECT_PLAN.md`, section 3.
 
@@ -59,10 +74,13 @@ cp .env.example .env
 # Edit .env and replace every <CHANGE_ME> — .env.example documents how to
 # generate each value (Fernet key, secret key, etc.). Never commit .env.
 
+# First `up` also BUILDS the custom Airflow image (orchestration/Dockerfile.airflow,
+# adds dbt + kafka client + boto3 + docker SDK to the stock Airflow image) —
+# expect a few of extra minutes on the first run only.
 docker compose -f infra/docker-compose.yml --env-file .env up -d
 docker compose -f infra/docker-compose.yml --env-file .env ps   # wait for all services "healthy"
 
-# Register the Debezium PostgreSQL source connector (one-time, after the stack is healthy)
+# Register the Debezium PostgreSQL source connector (idempotent — safe to re-run)
 set -a && source .env && set +a
 ./infra/kafka-connect/register-connector.sh
 ```
@@ -83,6 +101,80 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 PYTHONPATH=. pytest -q
 ```
+
+## Run the Pipeline (Phase 1)
+
+The batch slice (Kafka → RustFS → raw → staging → curated → serving) runs
+**inside Airflow** as the `gaming_pipeline` DAG. The generator + CDC stream
+continuously and independently; Airflow owns everything from the topic onward.
+
+```bash
+# 1. Seed the source with synthetic events (the "source system" writing its OLTP table)
+make generate COUNT=5000          # or: make generate-forever
+
+# 2. Trigger the DAG for a specific logical date (Airflow UI or CLI)
+docker exec gaming-airflow-scheduler airflow dags unpause gaming_pipeline
+docker exec gaming-airflow-scheduler airflow dags trigger \
+  gaming_pipeline -e 2026-10-09T00:00:00+00:00   # -e = the logical date the run is FOR
+
+# 3. Or run the whole loop + verification as one command:
+make smoke                        # seeds 5000 events, triggers for today, verifies all layers
+SMOKE_DS=2026-10-09 SMOKE_COUNT=5000 make smoke   # explicit logical date
+```
+
+DAG shape (each stage a separate task, explicit dependencies):
+
+```
+land_raw_kafka_to_rustfs ─▶ load_raw_to_postgres ─▶ dbt_run_staging ─▶ dbt_test_staging ─▶ dbt_run_curated ─▶ publish_serving
+spark_connectivity_proof (parallel — Spark integration proof, see docs/decisions/0001)
+```
+
+**Expected result:** the run reaches `success`; the layer row counts from
+the smoke test reconcile (staging is 1:1 with raw; the fact equals its
+staging slice; the difference is documented dirty rows flagged to NULL, not
+dropped). Sample per-layer verification:
+
+```bash
+# raw + staging + curated + serving (warehouse)
+docker exec gaming-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
+  "SELECT (SELECT count(*) FROM raw.game_events) raw,
+          (SELECT count(*) FROM staging.stg_game_events) staging,
+          (SELECT count(*) FROM curated.fct_in_game_transaction) fct,
+          (SELECT count(*) FROM serving.v_player_engagement_daily) serving"
+
+# raw objects in RustFS (dt=<logical date> partitions)
+aws --endpoint-url http://localhost:9000 s3 ls s3://raw-game-events/raw/game_events/ --recursive
+
+# serving CSV report (exported, consumer-visible artifact)
+aws --endpoint-url http://localhost:9000 s3 ls s3://raw-game-events/serving/player_engagement_daily/ --recursive
+```
+
+**Idempotency / re-runs:** re-running the same logical date creates no
+duplicates — raw objects are keyed by Kafka offset range (overwritten),
+raw rows upsert via `ON CONFLICT (event_id) DO NOTHING`, curated models are
+full-refresh tables, serving is `CREATE OR REPLACE VIEW` + deterministic
+report key. Different logical dates coexist (`source_partition_date` /
+`dt=<date>` partitions).
+
+**Restart persistence:** `make down` + `make up` keeps all named volumes —
+previous results are still there and the pipeline runs again.
+
+**Deliberate failure demo** (documented for reviewers):
+
+```bash
+PIPELINE_FAIL_SWITCH=1 make up   # recreate Airflow with the failure switch on
+make smoke                       # run fails at land_raw_kafka_to_rustfs (AirflowFailException),
+                                 # all downstream tasks are skipped, run marked failed
+PIPELINE_FAIL_SWITCH=0 make up   # back to normal
+```
+
+**Retries:** the ingestion task retries twice with a 1-minute delay;
+all other tasks retry twice (default_args).
+
+**Where to look for logs:** Airflow UI → `gaming_pipeline` → task logs
+(each task logs start/end, input/output locations, rows read/written), or
+`docker logs gaming-airflow-scheduler`. Smoke prints the per-layer table to
+stdout. See `docs/evidence/phase-1.md`.
 
 ## Stopping / Restarting Infrastructure
 
@@ -138,36 +230,24 @@ infrastructure, `transformation` = transformation (both dbt and Spark),
 `orchestration` = scheduling, `config` = central configuration, `tests` =
 automated checks, `docs` = planning and design documentation.
 
-## Current Status — Phase 0
+## Current Status — Phase 1 (walking skeleton)
 
-Delivered:
-- Docker Compose brings up: source Postgres (CDC-enabled), warehouse
-  Postgres, Airflow's metadata Postgres, Kafka, Kafka Connect (Debezium),
-  RustFS, Spark (master + worker), and Airflow (webserver + scheduler) —
-  all with pinned image versions, healthchecks, and persistent named
-  volumes.
-- `raw` / `staging` / `curated` schemas are created in the warehouse, and
-  `source.game_events` is created in the source database, on first boot.
-- Ingestion skeleton: a synthetic gaming-event generator (with configurable
-  dirty-record and schema-drift rates) plus a Postgres writer CLI
-  (`db_writer.py`) and a Kafka-to-RustFS consumer CLI, both runnable and
-  unit-tested. The Debezium connector config is defined but registration
-  is a manual, documented step (`register-connector.sh`) — continuous
-  end-to-end CDC flow is a Phase 1 deliverable.
-- Orchestration skeleton: one Airflow DAG defining the intended task graph
-  (`load_raw_to_postgres → dbt_run_staging → dbt_run_curated`, and
-  `load_raw_to_postgres → spark_batch_daily_engagement`), created paused
-  since task bodies are placeholders.
-- Transformation skeleton: a dbt project (`dbt_gaming`) with a real,
-  compilable staging passthrough model and a documented curated-layer
-  placeholder, plus a Spark batch job skeleton with a working CLI
-  (`--help`, argument parsing) and no aggregation logic yet.
-- No business logic, real data loading, real transformations, or real
-  Spark aggregation are implemented yet — that is explicitly out of scope
-  for Phase 0 per the assignment and is scheduled for Phases 1–3
-  (`docs/PROJECT_PLAN.md`, section 8).
+**Phase 0 (done):** Docker Compose stack (source Postgres CDC-enabled,
+warehouse Postgres, Airflow metadata DB, Kafka, Kafka Connect, RustFS,
+Spark, Airflow) with pinned images, healthchecks and persistent volumes;
+schemas + source table on first boot; generator, DB writer and
+Kafka-to-RustFS consumer CLIs, unit-tested.
 
-Not yet implemented (by design, later phases): real raw-to-Postgres
-loading, cleaned staging models, curated dimensional model, real Spark
-aggregation logic, dbt tests wired into the DAG, serving views, CI/PR
-workflow.
+**Phase 1 (done):** the batch slice runs end to end inside Airflow:
+`land_raw_kafka_to_rustfs → load_raw_to_postgres → dbt_run_staging →
+dbt_test_staging (DQ gate) → dbt_run_curated → publish_serving`, plus a
+parallel `spark_connectivity_proof` (real S3A batch job = Phase 3, ADR 0001).
+Logical-date parameterised, idempotent re-runs, restart-safe, deliberate
+failure switch (`PIPELINE_FAIL_SWITCH`), 4 DQ checks that can fail the run,
+serving view + CSV report, one-command smoke test (`make smoke`), CI
+workflow (ruff + compile + compose validation). Evidence:
+`docs/evidence/phase-1.md`.
+
+**Still planned (later phases):** real Spark S3A aggregation (Phase 3),
+deeper transformations/SCD2 (Phase 2), streaming pipeline replacing the
+batch consumer (Phase 2+), BI dashboard (Phase 4).
