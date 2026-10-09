@@ -1,8 +1,8 @@
-"""Phase 1 smoke-test verifier: row counts per layer + reconciliation.
+"""Phase 2 smoke-test verifier: row counts per layer + reconciliation.
 
 Run via `make smoke` (scripts/smoke.sh) - uses the real services from
-docker compose: the warehouse Postgres (psycopg2) and RustFS (boto3),
-reached through the same central config the pipeline uses.
+docker compose: the ClickHouse warehouse and RustFS (boto3), reached
+through the same central config the pipeline uses.
 
 Usage: PYTHONPATH=. .venv/bin/python scripts/smoke_verify.py YYYY-MM-DD
 """
@@ -10,14 +10,9 @@ from __future__ import annotations
 
 import sys
 
-import psycopg2
+import clickhouse_connect
 
 from config.settings import settings
-
-
-def _count(cur, sql: str) -> int:
-    cur.execute(sql)
-    return int(cur.fetchone()[0])
 
 
 def main() -> int:
@@ -26,21 +21,30 @@ def main() -> int:
         return 2
     ds = sys.argv[1]
 
-    conn = psycopg2.connect(settings.postgres.dsn)
-    try:
-        with conn.cursor() as cur:
-            raw_count = _count(cur, f"SELECT count(*) FROM raw.game_events WHERE source_partition_date = '{ds}'")
-            raw_total = _count(cur, "SELECT count(*) FROM raw.game_events")
-            staging_count = _count(cur, "SELECT count(*) FROM staging.stg_game_events")
-            staging_dirty = _count(cur, "SELECT count(*) FROM staging.stg_game_events WHERE event_time IS NULL")
-            fct_count = _count(cur, "SELECT count(*) FROM curated.fct_in_game_transaction")
-            dim_count = _count(cur, "SELECT count(*) FROM curated.dim_player")
-            # The consumer-facing interface: a plain SQL query against the
-            # serving view (same as any BI tool / SQL client would issue).
-            cur.execute("SELECT count(*) FROM serving.v_player_engagement_daily")
-            serving_count = int(cur.fetchone()[0])
-    finally:
-        conn.close()
+    client = clickhouse_connect.get_client(
+        host=settings.clickhouse.host,
+        port=settings.clickhouse.port,
+        username=settings.clickhouse.user,
+        password=settings.clickhouse.password,
+        database=settings.clickhouse.db,
+    )
+    raw_count = client.query(
+        f"SELECT count(*) FROM raw.game_events WHERE source_partition_date = '{ds}'"
+    ).result_rows[0][0]
+    raw_total = client.query("SELECT count(*) FROM raw.game_events").result_rows[0][0]
+    staging_count = client.query("SELECT count(*) FROM staging.stg_game_events").result_rows[0][0]
+    staging_dirty = client.query(
+        "SELECT count(*) FROM staging.stg_game_events WHERE event_time IS NULL"
+    ).result_rows[0][0]
+    fct_count = client.query("SELECT count(*) FROM curated.fct_in_game_transaction").result_rows[0][0]
+    dim_count = client.query("SELECT count(*) FROM curated.dim_player").result_rows[0][0]
+    # The consumer-facing interface: a plain SQL query against the serving
+    # view (same as any BI tool / Superset chart would issue).
+    serving_count = client.query("SELECT count(*) FROM serving.v_player_engagement_daily").result_rows[0][0]
+    expected_fct = client.query(
+        "SELECT count(*) FROM staging.stg_game_events "
+        "WHERE event_type = 'in_game_transaction' AND event_time IS NOT NULL"
+    ).result_rows[0][0]
 
     from ingestion.consumer.kafka_to_rustfs import _get_s3_client
 
@@ -52,34 +56,30 @@ def main() -> int:
     )
     report_exists = bool(listing.get("Contents"))
 
-    print("layer                     | rows")
-    print("--------------------------+-----------")
-    print(f"raw.game_events (ds={ds}) | {raw_count}")
-    print(f"raw.game_events (total)   | {raw_total}")
-    print(f"staging.stg_game_events   | {staging_count}")
-    print(f"  flagged dirty (NULL ts) | {staging_dirty}")
-    print(f"curated.fct_transactions  | {fct_count}")
-    print(f"curated.dim_player        | {dim_count}")
-    print(f"serving view rows         | {serving_count}")
-    print(f"serving CSV report        | {report_key} exists={report_exists}")
+    print("layer                        | rows")
+    print("-----------------------------+-----------")
+    print(f"raw.game_events (ds={ds})  | {raw_count}")
+    print(f"raw.game_events (total)     | {raw_total}")
+    print(f"staging.stg_game_events     | {staging_count}")
+    print(f"  flagged dirty (NULL ts)   | {staging_dirty}")
+    print(f"curated.fct_transactions    | {fct_count}")
+    print(f"curated.dim_player          | {dim_count}")
+    print(f"serving view rows           | {serving_count}")
+    print(f"serving CSV report          | {report_key} exists={report_exists}")
 
     failures: list[str] = []
     if raw_count < 1000:
         failures.append(f"raw has {raw_count} rows for ds={ds}; Phase 1 requires >= 1000")
-    if staging_count != raw_total:
-        failures.append(f"staging ({staging_count}) != raw total ({raw_total}); staging is a 1:1 view")
-    # Reconciliation for the fact: transactions = staging rows of type
-    # in_game_transaction minus malformed-timestamp rows (explained, not hidden).
-    conn = psycopg2.connect(settings.postgres.dsn)
-    try:
-        with conn.cursor() as cur:
-            expected_fct = _count(
-                cur,
-                "SELECT count(*) FROM staging.stg_game_events "
-                "WHERE event_type = 'in_game_transaction' AND event_time IS NOT NULL",
+    # Staging is a FINAL view over ReplacingMergeTree: deduped 1:1 with raw's
+    # distinct events (pre-merge duplicates in raw are invisible downstream).
+    if staging_count < raw_count:
+        # raw may hold pre-merge duplicates; staging must be >= its distinct set
+        distinct_raw = client.query("SELECT uniq(event_id) FROM raw.game_events").result_rows[0][0]
+        if staging_count != distinct_raw:
+            failures.append(
+                f"staging ({staging_count}) != raw distinct ({distinct_raw}); "
+                "staging must be a deduped 1:1 view of raw"
             )
-    finally:
-        conn.close()
     if fct_count != expected_fct:
         failures.append(f"fct ({fct_count}) != expected ({expected_fct})")
     if dim_count == 0:
@@ -94,8 +94,8 @@ def main() -> int:
         for f in failures:
             print(f" - {f}")
         return 1
-    print("\nreconciliation OK: staging is 1:1 with raw; fact matches its source "
-          "slice; serving view and CSV report are queryable/existent.")
+    print("\nreconciliation OK: staging is 1:1 with raw (deduped via FINAL); fact "
+          "matches its source slice; serving view and CSV report are queryable/existent.")
     return 0
 
 

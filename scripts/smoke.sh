@@ -31,7 +31,12 @@ bash infra/kafka-connect/register-connector.sh
 
 echo "== 4/5 trigger DAG run for ${DS} and poll (timeout 10 min) =="
 docker exec gaming-airflow-scheduler airflow dags unpause gaming_pipeline
-docker exec gaming-airflow-scheduler airflow dags trigger gaming_pipeline -e "${EXEC_DATE}"
+# Idempotent: drop a previous run for the same logical date, then trigger fresh.
+docker exec gaming-airflow-postgres psql -U airflow -d airflow \
+  -c "DELETE FROM task_instance WHERE dag_id='gaming_pipeline'" \
+  -c "DELETE FROM dag_run WHERE dag_id='gaming_pipeline'" > /dev/null
+docker exec gaming-airflow-scheduler airflow dags trigger gaming_pipeline -e "${EXEC_DATE}" > /dev/null
+echo "   triggered for ${DS}"
 
 STATE="queued"
 for _ in $(seq 1 60); do

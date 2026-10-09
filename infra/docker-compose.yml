@@ -26,13 +26,13 @@ x-airflow-common: &airflow-common
     RUSTFS_RAW_BUCKET: ${RUSTFS_RAW_BUCKET}
     SPARK_MASTER_URL: spark://spark-master:7077
     AIRFLOW_CONN_SOURCE_POSTGRES: postgresql://${SOURCE_POSTGRES_USER}:${SOURCE_POSTGRES_PASSWORD}@postgres-source:5432/${SOURCE_POSTGRES_DB}
-    # Warehouse connection used by the raw-loader, dbt profiles and the
-    # serving publisher inside the Airflow containers.
-    POSTGRES_HOST: postgres
-    POSTGRES_PORT: "5432"
-    POSTGRES_DB: ${POSTGRES_DB}
-    POSTGRES_USER: ${POSTGRES_USER}
-    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    # Warehouse (ClickHouse) connection used by the raw-loader, dbt profiles
+    # and the serving publisher inside the Airflow containers.
+    CLICKHOUSE_HOST: clickhouse
+    CLICKHOUSE_PORT: "8123"
+    CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+    CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+    CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
     # Deliberate-failure switch for the Phase 1 demo: set PIPELINE_FAIL_SWITCH=1
     # in .env, `make up` again, trigger the DAG -> land_raw task raises and
     # everything downstream is skipped. Remove it (or set to 0) to run normally.
@@ -77,20 +77,32 @@ services:
     networks:
       - gaming-net
 
-  postgres:
-    image: postgres:16.4
-    container_name: gaming-postgres
+  # Analytic warehouse (was PostgreSQL 16.4 until Phase 1; replaced by
+  # ClickHouse for columnar scan speed and native aggregates - see
+  # docs/az/TEXNIKI_IZAHLAR.md, "Anbar seçimi"). The source OLTP database
+  # (`postgres-source`) stays PostgreSQL - that one is the "source system",
+  # not the warehouse.
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8.14.39
+    container_name: gaming-clickhouse
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
     ports:
-      - "5432:5432"
+      - "8123:8123"   # HTTP interface (dbt-clickhouse, Superset, curl)
+      - "9004:9000"   # native protocol (host maps 9004 because RustFS owns
+                      # host port 9000; inside the compose network services
+                      # reach ClickHouse by name, not host port)
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
     volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "wget -qO- 'http://localhost:8123/ping' | grep -q Ok"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -180,6 +192,60 @@ services:
       DYNAMIC_CONFIG_ENABLED: "true"
     depends_on:
       kafka:
+        condition: service_healthy
+    networks:
+      - gaming-net
+
+  # Analytic dashboard (Phase 2): connects to the ClickHouse warehouse over
+  # the HTTP interface (8123) and visualises the curated/serving models -
+  # including the live event view built on the Kafka push channel.
+  # Credentials come from .env (SUPERSET_* variables); the ClickHouse
+  # database connection is created once via the UI (documented in
+  # docs/az/TEXNIKI_IZAHLAR.md) so no secret ends up in the repo.
+  superset:
+    image: apache/superset:4.1.1
+    container_name: gaming-superset
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      SUPERSET_ADMIN_USER: ${SUPERSET_ADMIN_USER}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
+    entrypoint: ["sh", "-c", "pip install --no-cache-dir clickhouse-connect==0.7.19 && exec superset run -h 0.0.0.0 -p 8088"]
+    command: []
+    ports:
+      - "8088:8088"
+    volumes:
+      - superset-data:/app/superset_home
+      - ./superset/bootstrap.py:/app/bootstrap.py:ro
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8088/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks:
+      - gaming-net
+
+  # One-shot bootstrap: runs migrations + creates the admin user, then exits.
+  # (Superset keeps its metadata DB in the mounted volume; re-running is safe.)
+  superset-init:
+    image: apache/superset:4.1.1
+    container_name: gaming-superset-init
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      SUPERSET_ADMIN_USER: ${SUPERSET_ADMIN_USER}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
+      SUPERSET__DATABASE__SQLA_URI: sqlite:////app/superset_home/superset.db
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+    entrypoint: ["sh", "-c", "pip install --no-cache-dir clickhouse-connect==0.7.19 && (superset db upgrade && superset fab create-admin --username $$SUPERSET_ADMIN_USER --password $$SUPERSET_ADMIN_PASSWORD --firstname Gaming --ylabel Admin || true) && superset init"]
+    volumes:
+      - superset-data:/app/superset_home
+      - ./superset/bootstrap.py:/app/bootstrap.py:ro
+    depends_on:
+      clickhouse:
         condition: service_healthy
     networks:
       - gaming-net
@@ -291,8 +357,9 @@ networks:
 
 volumes:
   postgres-source-data:
-  postgres-data:
+  clickhouse-data:
   postgres-airflow-data:
   kafka-data:
   rustfs-data:
   airflow-logs:
+  superset-data:

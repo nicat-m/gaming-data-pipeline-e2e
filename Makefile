@@ -43,3 +43,6 @@ test: ## Run the test suite
 
 smoke: ## End-to-end smoke test (make smoke; or SMOKE_DS=2026-10-08 SMOKE_COUNT=5000 make smoke)
 	bash scripts/smoke.sh
+
+rerun: ## Delete today's dag run and trigger a fresh one (dev convenience)
+	bash scripts/rerun.sh

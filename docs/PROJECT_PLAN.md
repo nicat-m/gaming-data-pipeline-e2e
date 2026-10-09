@@ -93,7 +93,7 @@ flowchart LR
     CONNECT -->|publish| KAFKA
     KAFKA -->|consume| CONSUMER
     CONSUMER -->|put_object, NDJSON batches| RUSTFS
-    AF -->|load_raw_to_postgres task| RUSTFS
+    AF -->|load_raw_to_clickhouse task| RUSTFS
     AF --> PGRAW
     PGRAW --> STG
     STG --> CUR
@@ -130,7 +130,7 @@ flowchart LR
   zone / data lake layer, so raw data is durable and queryable by any
   S3-aware tool before it ever touches the warehouse.
 - **Postgres warehouse, `raw` schema** — the warehouse-side copy of the
-  same raw data, loaded by an Airflow task (`load_raw_to_postgres`) so
+  same raw data, loaded by an Airflow task (`load_raw_to_clickhouse`) so
   SQL-based transformation (dbt) can operate on it.
 - **dbt staging models** — 1:1 cleaned/typed views on top of `raw` (dedup,
   casts, explicit handling of drifted/dirty fields). Materialized as views.
@@ -144,8 +144,8 @@ flowchart LR
   engine, applied specifically to the one aggregate that benefits from
   distributed compute rather than row-by-row SQL as raw volume grows — see
   Section 4 for why this job is Spark's and not dbt's.
-- **Airflow** — schedules and sequences `load_raw_to_postgres → dbt run
-  staging → dbt run curated`, plus `load_raw_to_postgres → spark_batch_
+- **Airflow** — schedules and sequences `load_raw_to_clickhouse → dbt run
+  staging → dbt run curated`, plus `load_raw_to_clickhouse → spark_batch_
   daily_engagement` in parallel; owns retry/failure handling. Airflow does
   **not** orchestrate the generator, Debezium, or the Kafka consumer —
   those run continuously and independently of the batch DAG.
@@ -220,8 +220,8 @@ Curated entities (planned, built out in Phase 2 per the roadmap below):
 
 - **Orchestration approach:** a single Airflow DAG (`gaming_pipeline`,
   `orchestration/dags/gaming_pipeline_dag.py`) covering the batch portion
-  only: `load_raw_to_postgres → dbt_run_staging → dbt_run_curated`, and
-  `load_raw_to_postgres → spark_batch_daily_engagement` in parallel. The
+  only: `load_raw_to_clickhouse → dbt_run_staging → dbt_run_curated`, and
+  `load_raw_to_clickhouse → spark_batch_daily_engagement` in parallel. The
   generator, Debezium connector, and Kafka consumer are **not** Airflow
   tasks — they run continuously as long-lived processes/services,
   independent of the DAG schedule.
@@ -248,7 +248,7 @@ Curated entities (planned, built out in Phase 2 per the roadmap below):
   re-running it for the same date is a full overwrite of that partition,
   not an append.
 - **Failure handling:** Airflow task-level `retries: 2` (see
-  `default_args` in the DAG). A failed `load_raw_to_postgres` blocks both
+  `default_args` in the DAG). A failed `load_raw_to_clickhouse` blocks both
   the dbt tasks and the Spark task (both depend on it), so bad raw data
   never silently reaches curated. Dirty records are not dropped at load
   time — they are carried through to staging and flagged, so failures are
@@ -282,7 +282,7 @@ add as an explicit Airflow task between staging and curated.
 | Phase | Scope | Definition of Done |
 |---|---|---|
 | **Phase 0 — Infrastructure & skeleton** (this delivery) | Repo, directory structure, Docker Compose infra (source Postgres, warehouse Postgres, Kafka, Kafka Connect/Debezium, RustFS, Spark, Airflow), config, placeholder ingestion/orchestration/transformation modules, docs | All Phase 0 DoD items in the assignment (see README "Current Status") |
-| **Phase 1 — Ingestion & Storage** | Register the Debezium connector for real; generator/consumer run continuously; raw data lands in RustFS and Postgres `raw` schema; implement `load_raw_to_postgres` | A scheduled Airflow run moves events end-to-end from `source.game_events` through CDC into `raw.game_events` with zero data loss and idempotent re-runs |
+| **Phase 1 — Ingestion & Storage** | Register the Debezium connector for real; generator/consumer run continuously; raw data lands in RustFS and Postgres `raw` schema; implement `load_raw_to_clickhouse` | A scheduled Airflow run moves events end-to-end from `source.game_events` through CDC into `raw.game_events` with zero data loss and idempotent re-runs |
 | **Phase 2 — Transformation** | Real staging models (cleaning, casts, drift handling) and curated dimensional model (Section 5) built in dbt | `dbt run` + `dbt test` succeed on a populated warehouse; curated tables match the documented grain/keys |
 | **Phase 3 — Batch Processing & Orchestration** | Implement the Spark `agg_player_daily_engagement` job for real (S3A read from RustFS, JDBC write to curated); DAG scheduled hourly; `dbt test` wired in as a blocking task; alerting on failure | A full scheduled run completes unattended, including the Spark task; a deliberately corrupted batch is caught by a dbt test and blocks curated refresh |
 | **Phase 4 — Serving & Consumption** | SQL views for the Growth team's actual questions; optional BI dashboard | A named business question from Section 1 can be answered with one query against the serving layer |
@@ -359,3 +359,12 @@ docker compose -f infra/docker-compose.yml --env-file .env down -v
   landing stays a custom consumer (orchestrated by Airflow in Phase 1+);
   the Kafka Connect S3 sink alternative is documented in the tech-stack
   table. Business-value framing added as section 1.1.
+
+- **2026-10-09 — Phase 2 (warehouse + dashboard):** the analytical warehouse moved
+  from PostgreSQL to **ClickHouse 24.8** (columnar scans, ReplacingMergeTree raw
+  with async dedup, FINAL reads for deterministic DQ tests; the OLTP source stays
+  PostgreSQL — that is the source system, not the warehouse). The raw loader is now
+  `load_raw_to_clickhouse` (batch insert via clickhouse-connect). **Apache Superset
+  4.1.1** joins the stack as the analytic dashboard (boot-time clickhouse-connect
+  install, admin from env, charts auto-refresh for near-live event monitoring) —
+  http://localhost:8088. Full Azerbaijani walkthrough: docs/az/LAYIHE_IZAHLARI.md.

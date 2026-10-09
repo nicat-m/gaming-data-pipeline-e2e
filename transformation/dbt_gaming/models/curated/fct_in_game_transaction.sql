@@ -1,8 +1,7 @@
--- Curated fact: one row per in-game transaction event.
--- Phase 1 is deliberately naive: dirty amounts (negative USD) are kept as-is
--- and will be filtered/tested properly in Phase 2. TODO Phase 2.
--- The table is materialized as a full-refresh table rebuilt from staging on
--- every run, which is itself idempotent (no duplicate rows on re-run).
+-- Curated fact: one row per in-game transaction event (ClickHouse table).
+-- Phase 2 is deliberately naive: dirty amounts (negative USD) are kept as-is
+-- and will be filtered/tested properly later. The ReplacingMergeTree table is
+-- rebuilt from staging on every run, which is itself idempotent.
 {{ config(materialized='table') }}
 
 select

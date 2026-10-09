@@ -17,6 +17,10 @@ load_dotenv()
 
 
 class PostgresSettings(BaseModel):
+    """DEPRECATED (kept for backwards compatibility of old .env files): the
+    warehouse moved from PostgreSQL to ClickHouse in Phase 2. New code should
+    use ClickHouseSettings."""
+
     user: str = os.getenv("POSTGRES_USER", "gaming_app")
     password: str = os.getenv("POSTGRES_PASSWORD", "")
     db: str = os.getenv("POSTGRES_DB", "gaming_lakehouse")
@@ -29,6 +33,21 @@ class PostgresSettings(BaseModel):
             f"postgresql://{self.user}:{self.password}"
             f"@{self.host}:{self.port}/{self.db}"
         )
+
+
+class ClickHouseSettings(BaseModel):
+    """The analytic warehouse (columnar). Receives raw loads from RustFS,
+    is transformed by dbt (dbt-clickhouse) and read by Superset."""
+
+    user: str = os.getenv("CLICKHOUSE_USER", "gaming")
+    password: str = os.getenv("CLICKHOUSE_PASSWORD", "")
+    db: str = os.getenv("CLICKHOUSE_DB", "gaming_lakehouse")
+    host: str = os.getenv("CLICKHOUSE_HOST", "localhost")
+    port: int = int(os.getenv("CLICKHOUSE_PORT", "8123"))
+
+    @property
+    def dsn(self) -> str:
+        return f"clickhouse://{self.host}:{self.port}"
 
 
 class SourcePostgresSettings(BaseModel):
@@ -80,7 +99,8 @@ class GeneratorSettings(BaseModel):
 
 
 class Settings(BaseModel):
-    postgres: PostgresSettings = PostgresSettings()
+    postgres: PostgresSettings = PostgresSettings()  # deprecated warehouse creds
+    clickhouse: ClickHouseSettings = ClickHouseSettings()
     source_postgres: SourcePostgresSettings = SourcePostgresSettings()
     kafka: KafkaSettings = KafkaSettings()
     kafka_connect: KafkaConnectSettings = KafkaConnectSettings()

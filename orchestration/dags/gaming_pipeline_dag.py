@@ -2,7 +2,7 @@
 Gaming Lakehouse batch pipeline - Phase 1 walking skeleton.
 
     land_raw_kafka_to_rustfs            (ingestion: Kafka -> RustFS raw zone)
-        -> load_raw_to_postgres         (raw: RustFS -> warehouse raw schema)
+        -> load_raw_to_clickhouse       (raw: RustFS -> ClickHouse raw database)
         -> dbt_run_staging              (staging: typed/cleaned 1:1 models)
         -> dbt_test_staging             (DQ checks - failure blocks downstream)
         -> dbt_run_curated              (curated: dim_player, fct_in_game_transaction)
@@ -32,9 +32,10 @@ import csv
 import io
 import json
 import os
-from datetime import datetime, timedelta, timezone
+import uuid
+from datetime import datetime, timedelta
 
-import psycopg2
+import clickhouse_connect
 from airflow import DAG
 from airflow.exceptions import AirflowFailException
 from airflow.operators.bash import BashOperator
@@ -43,28 +44,32 @@ from airflow.operators.python import PythonOperator
 from config.settings import settings
 
 RAW_TABLE_DDL = """
-CREATE TABLE IF NOT EXISTS raw.game_events (
-    event_id             UUID PRIMARY KEY,
-    event_type           TEXT NOT NULL,
-    event_time_raw       TEXT,
-    session_id           UUID,
-    amount_usd           DOUBLE PRECISION,
-    currency             TEXT,
-    player_id            UUID,
-    player_display_name  TEXT,
-    player_country       TEXT,
-    player_signup_date   DATE,
-    device_id            UUID,
-    device_platform      TEXT,
-    device_os_version    TEXT,
-    game_id              TEXT,
-    game_name            TEXT,
-    game_genre           TEXT,
-    extra                JSONB NOT NULL DEFAULT '{}'::jsonb,
-    source_partition_date DATE NOT NULL,
-    loaded_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+CREATE TABLE IF NOT EXISTS raw.game_events
+(
+    event_id              UUID,
+    event_type            String,
+    event_time_raw        String,
+    session_id            Nullable(UUID),
+    amount_usd            Nullable(Float64),
+    currency              Nullable(String),
+    player_id             Nullable(UUID),
+    player_display_name   Nullable(String),
+    player_country        Nullable(String),
+    player_signup_date    Nullable(String),  # ISO date from Debezium epoch-days
+    device_id             UUID,
+    device_platform       String,
+    device_os_version     Nullable(String),
+    game_id               String,
+    game_name             Nullable(String),
+    game_genre            Nullable(String),
+    extra                 String DEFAULT '{}',
+    source_partition_date String,  # partition key dt=<YYYY-MM-DD> (keeps the raw layer dumb)
+    loaded_at             DateTime DEFAULT now()
 )
+ENGINE = ReplacingMergeTree
+ORDER BY (source_partition_date, event_id)
 """
+
 
 RAW_COLUMNS = [
     "event_id", "event_type", "event_time_raw", "session_id", "amount_usd",
@@ -116,59 +121,68 @@ def land_raw_kafka_to_rustfs(partition_date: str, **_context) -> dict:
 def _coerce_raw_value(column: str, value):
     """Map Debezium JSON payload values to the raw column types.
 
-    - Debezium serialises Postgres DATE as days since 1970-01-01 (an int) -
-      convert back to an ISO date string.
-    - event_time_raw arrives as an ISO string and stays one.
-    - Debezium wraps UUIDs as plain strings in JSON mode - pass through.
+    Raw-layer philosophy: land the payload as it arrived - no typing here
+    (that is the dbt staging layer's job). Only the minimum is done to fit
+    the raw table's column types:
+
+    - UUID columns accept uuid objects (Debezium JSON mode sends strings).
+    - Debezium DATE (player_signup_date) arrives as epoch-days int; stored
+      as-is (string) and cast to a real Date in staging.
+    - Numeric values (amount_usd) pass through as floats for Float64.
     """
     if value is None:
         return None
+    if column in ("event_id", "player_id", "device_id", "session_id"):
+        try:
+            return uuid.UUID(str(value))
+        except ValueError:
+            return None  # malformed id: keep the row, null the id
     if column == "player_signup_date":
-        return (datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(days=int(value))).date()
+        return str(value)  # epoch-days int as received; typed in staging
     return value
 
 
-def load_raw_to_postgres(partition_date: str, **_context) -> int:
+def load_raw_to_clickhouse(partition_date: str, **_context) -> int:
     """Raw-load task: land every NDJSON object for the logical date in the
-    warehouse raw schema.
+    ClickHouse raw database.
 
-    Idempotency: `ON CONFLICT (event_id) DO NOTHING` - running the pipeline
-    twice for the same logical date inserts nothing the second time.
+    Idempotency: ReplacingMergeTree + the same (source_partition_date,
+    event_id) ORDER BY key make re-runs converge to one row per event - a
+    re-run's insert collapses on the next merge (or is deduped at read time
+    with FINAL / argMax in the curated models).
     """
-    task = "load_raw_to_postgres"
+    task = "load_raw_to_clickhouse"
     prefix = f"raw/game_events/dt={partition_date}/"
     s3 = _get_s3_client()
     objects = s3.list_objects_v2(Bucket=settings.rustfs.raw_bucket, Prefix=prefix).get("Contents", [])
     _print(task, f"start: input=s3://{settings.rustfs.raw_bucket}/{prefix} "
-                 f"({len(objects)} objects) output={settings.postgres.host}:"
-                 f"{settings.postgres.port}/{settings.postgres.db} raw.game_events")
+                 f"({len(objects)} objects) output={settings.clickhouse.host}:"
+                 f"{settings.clickhouse.port} raw.game_events")
 
     rows_read = 0
     rows_inserted = 0
-    conn = psycopg2.connect(settings.postgres.dsn)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(RAW_TABLE_DDL)
-            conn.commit()
-            for obj in objects:
-                body = s3.get_object(Bucket=settings.rustfs.raw_bucket, Key=obj["Key"])
-                records = [json.loads(line) for line in body["Body"].read().splitlines() if line.strip()]
-                rows_read += len(records)
-                for rec in records:
-                    row = rec.get("after") if isinstance(rec.get("after"), dict) else rec
-                    values = [_coerce_raw_value(col, row.get(col)) for col in RAW_COLUMNS]
-                    cur.execute(
-                        f"INSERT INTO raw.game_events ({', '.join(RAW_COLUMNS)}, source_partition_date) "
-                        f"VALUES ({', '.join(['%s'] * len(RAW_COLUMNS))}, %s) "
-                        f"ON CONFLICT (event_id) DO NOTHING",
-                        (*values, partition_date),
-                    )
-                    rows_inserted += cur.rowcount
-            conn.commit()
-    finally:
-        conn.close()
+    client = _get_clickhouse_client()
+    client.command(RAW_TABLE_DDL)
+    _print(task, "raw.game_events table ready (ReplacingMergeTree)")
+
+    for obj in objects:
+        body = s3.get_object(Bucket=settings.rustfs.raw_bucket, Key=obj["Key"])
+        records = [json.loads(line) for line in body["Body"].read().splitlines() if line.strip()]
+        rows_read += len(records)
+        batch = []
+        for rec in records:
+            row = rec.get("after") if isinstance(rec.get("after"), dict) else rec
+            values = [_coerce_raw_value(col, row.get(col)) for col in RAW_COLUMNS]
+            batch.append((*values, partition_date))  # raw layer: dt=<date> stays a string
+        if batch:
+            client.insert(
+                "raw.game_events",
+                batch,
+                column_names=[*RAW_COLUMNS, "source_partition_date"],
+            )
+            rows_inserted += len(batch)
     _print(task, f"end: rows_read={rows_read} rows_inserted={rows_inserted} "
-                 f"(re-run skips {rows_read - rows_inserted} duplicates via event_id PK)")
+                 f"(ReplacingMergeTree dedupes re-runs on the same event_id)")
     return rows_inserted
 
 
@@ -201,8 +215,8 @@ def spark_connectivity_proof(**_context) -> None:
 
 def publish_serving(partition_date: str, **_context) -> None:
     """Serving task: expose one curated object for consumers - a SQL view
-    (`serving.v_player_engagement_daily`, queryable by any SQL client/BI
-    tool) and a CSV report exported to RustFS under serving/.
+    (`serving.v_player_engagement_daily`, queryable by Superset / any SQL
+    client) and a CSV report exported to RustFS under serving/.
 
     Idempotency: CREATE OR REPLACE VIEW + deterministic report object key
     (dt=<ds>/report.csv) make re-runs overwrite instead of duplicate.
@@ -213,35 +227,43 @@ def publish_serving(partition_date: str, **_context) -> None:
     SELECT
         p.player_id,
         p.country,
-        COUNT(f.event_id)  AS transactions,
-        SUM(f.amount_usd)  AS total_amount_usd,
-        MAX(f.event_time)  AS last_txn_at
+        count(f.event_id)        AS transactions,
+        sum(f.amount_usd)        AS total_amount_usd,
+        max(f.event_time)        AS last_txn_at
     FROM curated.fct_in_game_transaction f
     JOIN curated.dim_player p USING (player_id)
     GROUP BY p.player_id, p.country
     """
-    conn = psycopg2.connect(settings.postgres.dsn)
-    try:
-        with conn.cursor() as cur:
-            cur.execute("CREATE SCHEMA IF NOT EXISTS serving")
-            cur.execute(view_sql)
-            cur.execute("SELECT * FROM serving.v_player_engagement_daily")
-            rows = cur.fetchall()
-            columns = [d[0] for d in cur.description]
-        conn.commit()
-    finally:
-        conn.close()
+    client = _get_clickhouse_client()
+    client.command("CREATE DATABASE IF NOT EXISTS serving")
+    client.command(view_sql)
+    rows = client.query("SELECT * FROM serving.v_player_engagement_daily")
+    columns = rows.column_names
 
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(columns)
-    writer.writerows(rows)
+    writer.writerows(rows.result_rows)
     key = f"serving/player_engagement_daily/dt={partition_date}/report.csv"
     s3 = _get_s3_client()
     s3.put_object(Bucket=settings.rustfs.raw_bucket, Key=key, Body=buf.getvalue().encode(), ContentType="text/csv")
-    _print(task, f"start: input=curated schema output=serving.v_player_engagement_daily "
+    _print(task, f"start: input=curated database output=serving.v_player_engagement_daily "
                  f"+ s3://{settings.rustfs.raw_bucket}/{key}")
-    _print(task, f"end: rows_published={len(rows)}")
+    _print(task, f"end: rows_published={len(rows.result_rows)}")
+
+
+def _get_clickhouse_client():
+    # Warehouse client used by the raw loader and the serving publisher.
+    # Inside the compose network the service name is `clickhouse`; the
+    # settings default (localhost) only matters for host-side CLI use.
+    host = settings.clickhouse.host
+    return clickhouse_connect.get_client(
+        host="clickhouse" if host in ("localhost", "127.0.0.1") else host,
+        port=settings.clickhouse.port,
+        username=settings.clickhouse.user,
+        password=settings.clickhouse.password,
+        database=settings.clickhouse.db,
+    )
 
 
 def _get_s3_client():
@@ -271,8 +293,8 @@ with DAG(
     )
 
     load_raw = PythonOperator(
-        task_id="load_raw_to_postgres",
-        python_callable=load_raw_to_postgres,
+        task_id="load_raw_to_clickhouse",
+        python_callable=load_raw_to_clickhouse,
         op_kwargs={"partition_date": "{{ ds }}"},
     )
 

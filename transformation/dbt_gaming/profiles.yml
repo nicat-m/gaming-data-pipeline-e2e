@@ -7,16 +7,11 @@ dbt_gaming:
   target: dev
   outputs:
     dev:
-      type: postgres
-      host: "{{ env_var('POSTGRES_HOST', 'localhost') }}"
-      port: "{{ env_var('POSTGRES_PORT', '5432') | as_number }}"
-      user: "{{ env_var('POSTGRES_USER') }}"
-      password: "{{ env_var('POSTGRES_PASSWORD') }}"
-      dbname: "{{ env_var('POSTGRES_DB') }}"
-      # Base schema for the project's dbt models. dbt's built-in custom-schema
-      # semantics concatenate base + folder override ("public_staging"), which
-      # does NOT match the plain raw/staging/curated schemas created by
-      # infra/postgres/init.sql. A tiny macro (generate_schema_name) maps the
-      # model folder (staging/, curated/) to the plain schema name instead.
-      schema: public
+      type: clickhouse
+      host: "{{ env_var('CLICKHOUSE_HOST', 'localhost') }}"
+      port: "{{ env_var('CLICKHOUSE_PORT', '8123') | as_number }}"
+      user: "{{ env_var('CLICKHOUSE_USER') }}"
+      password: "{{ env_var('CLICKHOUSE_PASSWORD') }}"
+      schema: "{{ env_var('CLICKHOUSE_DB', 'gaming_lakehouse') }}"
+      driver: http
       threads: 4

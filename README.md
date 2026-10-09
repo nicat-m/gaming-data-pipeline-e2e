@@ -18,8 +18,8 @@ flowchart LR
     CONNECT -->|publish| KAFKA[(Kafka topic ✅)]
     KAFKA -->|consume, in Airflow| CONSUMER[Kafka consumer ✅]
     CONSUMER -->|NDJSON batches| RUSTFS[(RustFS raw zone ✅)]
-    AF[Airflow DAG ✅] --> PGRAW[(Postgres: raw ✅)]
-    PGRAW --> STG[dbt staging ✅]
+    AF[Airflow DAG ✅] --> CH[(ClickHouse: raw/staging/curated ✅)]
+    CH --> STG[dbt staging ✅]
     STG -->|dbt tests ✅ DQ gate| CUR[dbt curated: dim + fact ✅]
     RUSTFS -.->|S3A read| SPARK[Spark batch job 📋 Phase 3]
     SPARK -.->|JDBC| CUR
@@ -34,10 +34,11 @@ Component roles (pipeline ↔ component mapping):
 | Ingestion / CDC | Debezium (Kafka Connect) streaming into Kafka |
 | Streaming buffer | Kafka topic `gaming.source.game_events` |
 | Raw landing zone | RustFS bucket (`raw/game_events/dt=<date>/`) — orchestrated consumer task |
-| Warehouse (raw/staging/curated) | Postgres + dbt (tests act as the DQ gate) |
+| Warehouse (raw/staging/curated/serving) | ClickHouse + dbt-clickhouse (tests act as the DQ gate) |
 | Batch compute | Spark — connectivity proof now, real S3A job in Phase 3 (ADR 0001) |
 | Orchestration | Airflow `gaming_pipeline` DAG (logical-date parameterised) |
 | Serving | `serving.v_player_engagement_daily` SQL view + CSV report on RustFS |
+| Dashboard | Apache Superset (auto-refresh charts on ClickHouse) |
 | Consumer | Product/Growth team — any SQL client/BI tool; reproducible via repo init SQL |
 
 Full component-by-component walkthrough: `docs/PROJECT_PLAN.md`, section 3.
@@ -51,7 +52,7 @@ Full component-by-component walkthrough: `docs/PROJECT_PLAN.md`, section 3.
 | Streaming backbone | Apache Kafka 3.8.0 (KRaft mode) |
 | Kafka observability | Kafka UI (Provectus) 0.7.2 |
 | Raw object storage | RustFS 1.0.0 (S3-compatible) |
-| Warehouse | PostgreSQL 16.4 (separate instance) |
+| Warehouse | ClickHouse 24.8 (columnar, ReplacingMergeTree raw) |
 | Transformation (dims/facts) | dbt-core 1.8.7 / dbt-postgres |
 | Batch processing (aggregates) | Apache Spark 3.5.3 (standalone master+worker) |
 | Orchestration | Apache Airflow 2.10.2 |
@@ -90,6 +91,8 @@ set -a && source .env && set +a
 - Spark master UI: http://localhost:8081
 - Kafka Connect REST API: http://localhost:8083
 - Kafka UI: http://localhost:8085
+- Superset (dashboard): http://localhost:8088 (credentials: `SUPERSET_ADMIN_*` from `.env`)
+- ClickHouse HTTP: `localhost:8123` (native: `localhost:9004`)
 - Postgres (source): `localhost:5433`, database from `SOURCE_POSTGRES_DB`
 - Postgres (warehouse): `localhost:5432`, database from `POSTGRES_DB`
 - Kafka broker: `localhost:9092`
@@ -125,7 +128,7 @@ SMOKE_DS=2026-10-09 SMOKE_COUNT=5000 make smoke   # explicit logical date
 DAG shape (each stage a separate task, explicit dependencies):
 
 ```
-land_raw_kafka_to_rustfs ─▶ load_raw_to_postgres ─▶ dbt_run_staging ─▶ dbt_test_staging ─▶ dbt_run_curated ─▶ publish_serving
+land_raw_kafka_to_rustfs ─▶ load_raw_to_clickhouse ─▶ dbt_run_staging ─▶ dbt_test_staging ─▶ dbt_run_curated ─▶ publish_serving
 spark_connectivity_proof (parallel — Spark integration proof, see docs/decisions/0001)
 ```
 
@@ -136,11 +139,11 @@ dropped). Sample per-layer verification:
 
 ```bash
 # raw + staging + curated + serving (warehouse)
-docker exec gaming-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
-  "SELECT (SELECT count(*) FROM raw.game_events) raw,
-          (SELECT count(*) FROM staging.stg_game_events) staging,
-          (SELECT count(*) FROM curated.fct_in_game_transaction) fct,
-          (SELECT count(*) FROM serving.v_player_engagement_daily) serving"
+docker exec gaming-clickhouse clickhouse-client --query "
+  SELECT 'raw' layer, count(*) FROM gaming_lakehouse.raw.game_events
+  UNION ALL SELECT 'staging', count(*) FROM gaming_lakehouse.staging.stg_game_events
+  UNION ALL SELECT 'fct', count(*) FROM gaming_lakehouse.curated.fct_in_game_transaction
+  UNION ALL SELECT 'serving', count(*) FROM gaming_lakehouse.serving.v_player_engagement_daily"
 
 # raw objects in RustFS (dt=<logical date> partitions)
 aws --endpoint-url http://localhost:9000 s3 ls s3://raw-game-events/raw/game_events/ --recursive
@@ -239,7 +242,7 @@ schemas + source table on first boot; generator, DB writer and
 Kafka-to-RustFS consumer CLIs, unit-tested.
 
 **Phase 1 (done):** the batch slice runs end to end inside Airflow:
-`land_raw_kafka_to_rustfs → load_raw_to_postgres → dbt_run_staging →
+`land_raw_kafka_to_rustfs → load_raw_to_clickhouse → dbt_run_staging →
 dbt_test_staging (DQ gate) → dbt_run_curated → publish_serving`, plus a
 parallel `spark_connectivity_proof` (real S3A batch job = Phase 3, ADR 0001).
 Logical-date parameterised, idempotent re-runs, restart-safe, deliberate
