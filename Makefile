@@ -39,3 +39,6 @@ consume: ## Consume Kafka topic into RustFS batches (runs until Ctrl+C; make con
 
 test: ## Run the test suite
 	PYTHONPATH=. $(PYTHON) -m pytest -q
+
+smoke: ## End-to-end smoke test (make smoke; or SMOKE_DS=2026-10-08 SMOKE_COUNT=5000 make smoke)
+	bash scripts/smoke.sh

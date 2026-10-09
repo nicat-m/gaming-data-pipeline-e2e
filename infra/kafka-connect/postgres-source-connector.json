@@ -13,6 +13,7 @@
     "plugin.name": "pgoutput",
     "slot.name": "gaming_debezium_slot",
     "publication.autocreate.mode": "filtered",
+    "decimal.handling.mode": "double",
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",
     "key.converter.schemas.enable": "false",

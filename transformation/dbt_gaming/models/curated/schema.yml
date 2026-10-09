@@ -1,0 +1,21 @@
+version: 2
+
+models:
+  - name: dim_player
+    description: One row per player (naive SCD1 for Phase 1; SCD2 is Phase 2).
+    columns:
+      - name: player_id
+        tests:
+          - not_null
+          - unique
+
+  - name: fct_in_game_transaction
+    description: One row per in-game transaction event.
+    columns:
+      - name: event_id
+        tests:
+          - not_null
+          - unique
+      - name: player_id
+        tests:
+          - not_null

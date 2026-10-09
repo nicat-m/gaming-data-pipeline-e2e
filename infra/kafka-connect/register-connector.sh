@@ -10,11 +10,23 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONNECT_URL="${KAFKA_CONNECT_URL:-http://localhost:8083}"
+CONNECTOR_NAME="gaming-postgres-source-connector"
 
 envsubst < "${SCRIPT_DIR}/postgres-source-connector.json" > /tmp/postgres-source-connector.rendered.json
 
-curl -s -X POST -H "Content-Type: application/json" \
-  --data @/tmp/postgres-source-connector.rendered.json \
-  "${CONNECT_URL}/connectors" | tee /dev/stderr
+# Idempotent: PUT (update) if the connector already exists, POST (create) if
+# not - safe to run repeatedly (the smoke test relies on this).
+if curl -sf "${CONNECT_URL}/connectors/${CONNECTOR_NAME}" > /dev/null 2>&1; then
+  echo "connector '${CONNECTOR_NAME}' exists - updating config"
+  curl -s -X PUT -H "Content-Type: application/json" \
+    --data @/tmp/postgres-source-connector.rendered.json \
+    "${CONNECT_URL}/connectors/${CONNECTOR_NAME}/config"
+else
+  echo "registering new connector '${CONNECTOR_NAME}'"
+  curl -s -X POST -H "Content-Type: application/json" \
+    --data @/tmp/postgres-source-connector.rendered.json \
+    "${CONNECT_URL}/connectors"
+fi
+echo
 
 rm -f /tmp/postgres-source-connector.rendered.json

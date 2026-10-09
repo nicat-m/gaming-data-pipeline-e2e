@@ -1,7 +1,14 @@
 name: gaming-lakehouse
 
 x-airflow-common: &airflow-common
-  image: apache/airflow:2.10.2-python3.11
+  # Custom image (dbt + kafka client + boto3 + docker SDK baked in) so every
+  # pipeline task can run inside the orchestrator - see
+  # orchestration/Dockerfile.airflow. `build` reuses the cache after the
+  # first `docker compose up`.
+  image: gaming-airflow:2.10.2-phase1
+  build:
+    context: ..
+    dockerfile: orchestration/Dockerfile.airflow
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -18,11 +25,28 @@ x-airflow-common: &airflow-common
     RUSTFS_RAW_BUCKET: ${RUSTFS_RAW_BUCKET}
     SPARK_MASTER_URL: spark://spark-master:7077
     AIRFLOW_CONN_SOURCE_POSTGRES: postgresql://${SOURCE_POSTGRES_USER}:${SOURCE_POSTGRES_PASSWORD}@postgres-source:5432/${SOURCE_POSTGRES_DB}
+    # Warehouse connection used by the raw-loader, dbt profiles and the
+    # serving publisher inside the Airflow containers.
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: ${POSTGRES_DB}
+    POSTGRES_USER: ${POSTGRES_USER}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    # Deliberate-failure switch for the Phase 1 demo: set PIPELINE_FAIL_SWITCH=1
+    # in .env, `make up` again, trigger the DAG -> land_raw task raises and
+    # everything downstream is skipped. Remove it (or set to 0) to run normally.
+    PIPELINE_FAIL_SWITCH: ${PIPELINE_FAIL_SWITCH:-0}
+    PYTHONPATH: /opt/airflow
   volumes:
     - ../orchestration/dags:/opt/airflow/dags
     - ../ingestion:/opt/airflow/ingestion
     - ../config:/opt/airflow/config
     - ../transformation:/opt/airflow/transformation
+    - ../transformation/spark_jobs:/opt/spark-apps
+    # Read-only docker socket: only used by the Spark connectivity-proof
+    # task (`docker exec`-equivalent via the docker SDK) to reach the
+    # standalone Spark container from Airflow.
+    - /var/run/docker.sock:/var/run/docker.sock:ro
     - airflow-logs:/opt/airflow/logs
   depends_on:
     postgres-airflow:
