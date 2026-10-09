@@ -231,5 +231,15 @@ with app.app_context():
     dash.position_json = _json.dumps(position_json)
 
     db.session.commit()
+
+    # Safety net: a dataset whose columns are still empty makes every chart on it
+    # fail with "Columns missing in dataset" / "Empty query?" - force a metadata
+    # refresh for those (idempotent, cheap).
+    for key, ds in datasets.items():
+        if not ds.columns:
+            ds.fetch_metadata()
+            print(f"forced metadata refresh: {key}")
+    db.session.commit()
+
     print("\nDone. Open: http://localhost:8088/superset/dashboard/gaming-live-overview/")
     sys.exit(0)
