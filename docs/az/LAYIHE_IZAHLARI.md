@@ -273,11 +273,20 @@ ilə gələcək.
 ```bash
 cp .env.example .env            # dəyərləri doldur (Fernet, secret key, parollar)
 make up                         # stack qalxır (ilk dəfə Airflow image build olunur ~3-5 dəq)
-make register-connector         # Debezium CDC (idempotent)
+make register-connector         # Debezium CDC (idempotent — hər up-dan sonra təhlükəsizdir)
+make seed-superset              # dashboard/chart-ları yaradır (idempotent — yalnız 1 dəfə, ya da layout dəyişəndə)
 make generate COUNT=5000 RATE=1000   # source-a 5000 event yaz
 make rerun                      # DAG-ı bugün üçün trigger et (və ya Airflow UI-dən)
 make smoke                      # uc-u-cərvə smoke test + qat yoxlaması
 ```
+
+> **`make clean` + `make up` sonrası qayda:** clean bütün volumeları sildiyi üçün
+> **hər şey sıfırdan** başlayır — data, connector qeydiyyatı, Superset dashboard,
+> Airflow admin user. `make up` bu yarpaqların bir çoxunu avtomatik edir (init
+> konteynerləri admin/migration işlərini görür), amma 2 manual addım həmişə lazımdır:
+> `make register-connector` və `make seed-superset` (hər ikisi idempotentdir —
+> təkrar işə salmaq təhlükəsizdir). Data üçün `make smoke` (və ya `generate` +
+> `rerun`) yenidən event yaratmalı olacaq, çünki clean köhnə datanı silib.
 
 Brauzerlər: Airflow `8080` · Superset `8088` · Kafka UI `8085` · Spark UI `8081` ·
 RustFS konsol `9001` · ClickHouse HTTP `8123`.

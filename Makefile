@@ -10,9 +10,13 @@ BATCH_SIZE ?= 200
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-up: ## Start the full infrastructure in the background
+up: ## Start the full infrastructure in the background (incl. first-boot setup)
 	$(COMPOSE) up -d
-	$(COMPOSE) ps
+	@echo ">> waiting for the stack to become healthy..."
+	@$(COMPOSE) up -d airflow-init superset-init 2>/dev/null || true
+	@$(COMPOSE) ps
+	@echo ">> next: make smoke  (or the manual steps in README)"
+	@echo ">> if this is the FIRST boot: make register-connector && make seed-superset"
 
 down: ## Stop the stack, keep data (named volumes persist)
 	$(COMPOSE) down
