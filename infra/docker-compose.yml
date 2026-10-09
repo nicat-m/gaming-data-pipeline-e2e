@@ -209,6 +209,7 @@ services:
       SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
       SUPERSET_ADMIN_USER: ${SUPERSET_ADMIN_USER}
       SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
+      SUPERSET_CONFIG_PATH: /app/superset_config.py
     entrypoint: ["sh", "-c", "pip install --no-cache-dir clickhouse-connect==0.7.19 && exec superset run -h 0.0.0.0 -p 8088"]
     command: []
     ports:
@@ -216,6 +217,7 @@ services:
     volumes:
       - superset-data:/app/superset_home
       - ../scripts/superset_seed.py:/app/superset_home/seed.py:ro
+      - ./superset/superset_config.py:/app/superset_config.py:ro
     depends_on:
       clickhouse:
         condition: service_healthy
