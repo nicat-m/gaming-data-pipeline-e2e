@@ -185,15 +185,34 @@ with app.app_context():
 
     # --------------------------------------------------------------- dashboard
     dash = db.session.query(Dashboard).filter_by(dashboard_title="Gaming Lakehouse — Live Overview").first()
+    def _chart_node(chart_id: int, node_id: str, row: int, col: int) -> dict:
+        # v2 layout: every CHART node MUST carry a meta dict with chart_id
+        # (plus chartSliceId in some versions) - a node without meta makes the
+        # React renderer throw and the dashboard stays on the loading spinner.
+        return {
+            "type": "CHART",
+            "id": node_id,
+            "chart_id": chart_id,
+            "parents": ["ROOT_ID"],
+            "width": 6,
+            "height": 24,
+            "meta": {
+                "chartId": chart_id,
+                "chart_id": chart_id,
+                "width": 6,
+                "height": 24,
+            },
+        }
+
     position_json = {
         # two-column stacked grid, three rows
         "DASHBOARD_VERSION_KEY": "v2",
-        "0-c0": {"type": "CHART", "id": charts[0].id, "parents": ["ROOT_ID"], "width": 6, "height": 24},
-        "0-c1": {"type": "CHART", "id": charts[1].id, "parents": ["ROOT_ID"], "width": 6, "height": 24},
-        "1-c0": {"type": "CHART", "id": charts[3].id, "parents": ["ROOT_ID"], "width": 6, "height": 24},
-        "1-c1": {"type": "CHART", "id": charts[4].id, "parents": ["ROOT_ID"], "width": 6, "height": 24},
-        "2-c0": {"type": "CHART", "id": charts[2].id, "parents": ["ROOT_ID"], "width": 6, "height": 24},
-        "2-c1": {"type": "CHART", "id": charts[5].id, "parents": ["ROOT_ID"], "width": 6, "height": 24},
+        "0-c0": _chart_node(charts[0].id, "0-c0", 0, 0),
+        "0-c1": _chart_node(charts[1].id, "0-c1", 0, 1),
+        "1-c0": _chart_node(charts[3].id, "1-c0", 1, 0),
+        "1-c1": _chart_node(charts[4].id, "1-c1", 1, 1),
+        "2-c0": _chart_node(charts[2].id, "2-c0", 2, 0),
+        "2-c1": _chart_node(charts[5].id, "2-c1", 2, 1),
         "ROOT_ID": {"type": "ROOT_ID", "id": "ROOT_ID"},
     }
     if dash is None:
@@ -201,6 +220,7 @@ with app.app_context():
             dashboard_title="Gaming Lakehouse — Live Overview",
             slug="gaming-live-overview",
             published=True,
+            json_metadata='{"refresh_frequency": 30, "timed_refresh_immune_slices": []}',
         )
         db.session.add(dash)
         print("dashboard created: Gaming Lakehouse — Live Overview")
