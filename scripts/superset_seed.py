@@ -193,6 +193,7 @@ with app.app_context():
             "type": "CHART",
             "id": node_id,
             "chart_id": chart_id,
+            "children": [],
             "parents": ["ROOT_ID"],
             "width": 6,
             "height": 24,
@@ -204,6 +205,7 @@ with app.app_context():
             },
         }
 
+    CHART_NODE_IDS = ["0-c0", "0-c1", "1-c0", "1-c1", "2-c0", "2-c1"]
     position_json = {
         # two-column stacked grid, three rows
         "DASHBOARD_VERSION_KEY": "v2",
@@ -213,7 +215,7 @@ with app.app_context():
         "1-c1": _chart_node(charts[4].id, "1-c1", 1, 1),
         "2-c0": _chart_node(charts[2].id, "2-c0", 2, 0),
         "2-c1": _chart_node(charts[5].id, "2-c1", 2, 1),
-        "ROOT_ID": {"type": "ROOT_ID", "id": "ROOT_ID"},
+        "ROOT_ID": {"type": "ROOT_ID", "id": "ROOT_ID", "children": list(CHART_NODE_IDS)},
     }
     if dash is None:
         dash = Dashboard(
