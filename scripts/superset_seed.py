@@ -185,37 +185,69 @@ with app.app_context():
 
     # --------------------------------------------------------------- dashboard
     dash = db.session.query(Dashboard).filter_by(dashboard_title="Gaming Lakehouse — Live Overview").first()
-    def _chart_node(chart_id: int, node_id: str, row: int, col: int) -> dict:
-        # v2 layout: every CHART node MUST carry a meta dict with chart_id
-        # (plus chartSliceId in some versions) - a node without meta makes the
-        # React renderer throw and the dashboard stays on the loading spinner.
+
+    def _chart_node(chart_id: int, node_id: str, slice_name: str, parents: list) -> dict:
+        # v2 layout: CHART nodes live INSIDE ROW nodes. meta carries chartId,
+        # sliceName and the col/row dims (width in 12-col grid units, height in
+        # 8px units). Without the ROW wrapper the renderer computes dimensions
+        # from a missing parent and crashes with "reading 'width' of undefined".
         return {
             "type": "CHART",
             "id": node_id,
-            "chart_id": chart_id,
             "children": [],
-            "parents": ["ROOT_ID"],
-            "width": 6,
-            "height": 24,
+            "parents": parents,
             "meta": {
                 "chartId": chart_id,
-                "chart_id": chart_id,
+                "sliceName": slice_name,
                 "width": 6,
-                "height": 24,
+                "height": 50,
             },
         }
 
-    CHART_NODE_IDS = ["0-c0", "0-c1", "1-c0", "1-c1", "2-c0", "2-c1"]
+    def _row_node(node_id: str, children: list, parents: list) -> dict:
+        return {
+            "type": "ROW",
+            "id": node_id,
+            "children": children,
+            "parents": parents,
+            "meta": {"background": "BACKGROUND_TRANSPARENT"},
+        }
+
+    # Grid: 3 rows x 2 chart columns (12-col grid -> width 6 per chart).
+    chart_specs = [
+        (charts[0].id, "Events over time (last 24h)"),
+        (charts[1].id, "Events by type (last 24h)"),
+        (charts[3].id, "Transactions per hour (last 7 days)"),
+        (charts[4].id, "Players by country"),
+        (charts[2].id, "Revenue by country (all time)"),
+        (charts[5].id, "KPI: players / events / revenue"),
+    ]
+    node_by_id: dict[str, dict] = {}
+    row_ids: list[str] = []
+    for row_idx in range(3):
+        row_id = f"ROW-{row_idx}"
+        chart_ids: list[str] = []
+        for col_idx in range(2):
+            node_id = f"CHART-{row_idx}-{col_idx}"
+            chart_id, slice_name = chart_specs[row_idx * 2 + col_idx]
+            node_by_id[node_id] = _chart_node(
+                chart_id, node_id, slice_name,
+                ["ROOT_ID", "GRID-0", row_id],
+            )
+            chart_ids.append(node_id)
+        node_by_id[row_id] = _row_node(row_id, chart_ids, ["ROOT_ID", "GRID-0"])
+        row_ids.append(row_id)
+
+    node_by_id["GRID-0"] = {
+        "type": "GRID",
+        "id": "GRID-0",
+        "children": row_ids,
+        "parents": ["ROOT_ID"],
+    }
     position_json = {
-        # two-column stacked grid, three rows
         "DASHBOARD_VERSION_KEY": "v2",
-        "0-c0": _chart_node(charts[0].id, "0-c0", 0, 0),
-        "0-c1": _chart_node(charts[1].id, "0-c1", 0, 1),
-        "1-c0": _chart_node(charts[3].id, "1-c0", 1, 0),
-        "1-c1": _chart_node(charts[4].id, "1-c1", 1, 1),
-        "2-c0": _chart_node(charts[2].id, "2-c0", 2, 0),
-        "2-c1": _chart_node(charts[5].id, "2-c1", 2, 1),
-        "ROOT_ID": {"type": "ROOT_ID", "id": "ROOT_ID", "children": list(CHART_NODE_IDS)},
+        "ROOT_ID": {"type": "ROOT_ID", "id": "ROOT_ID", "children": ["GRID-0"]},
+        **node_by_id,
     }
     if dash is None:
         dash = Dashboard(
