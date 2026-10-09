@@ -236,8 +236,8 @@ automated checks, `docs` = planning and design documentation.
 ## Current Status — Phase 1 (walking skeleton)
 
 **Phase 0 (done):** Docker Compose stack (source Postgres CDC-enabled,
-warehouse Postgres, Airflow metadata DB, Kafka, Kafka Connect, RustFS,
-Spark, Airflow) with pinned images, healthchecks and persistent volumes;
+ClickHouse warehouse, Airflow metadata DB, Kafka, Kafka Connect, RustFS,
+Spark, Superset) with pinned images, healthchecks and persistent volumes;
 schemas + source table on first boot; generator, DB writer and
 Kafka-to-RustFS consumer CLIs, unit-tested.
 

@@ -243,7 +243,7 @@ services:
     entrypoint: ["sh", "-c", "pip install --no-cache-dir clickhouse-connect==0.7.19 && (superset db upgrade && superset fab create-admin --username $$SUPERSET_ADMIN_USER --password $$SUPERSET_ADMIN_PASSWORD --firstname Gaming --lastname Admin --email admin@gaming.local || true) && superset init"]
     volumes:
       - superset-data:/app/superset_home
-      - ./superset/bootstrap.py:/app/bootstrap.py:ro
+      - ../scripts/superset_seed.py:/app/superset_home/seed.py:ro
     depends_on:
       clickhouse:
         condition: service_healthy

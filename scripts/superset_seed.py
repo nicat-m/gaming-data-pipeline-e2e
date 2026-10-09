@@ -64,6 +64,7 @@ with app.app_context():
     # ------------------------------------------------------------------ charts
     def make_chart(_slug, name, viz, ds_key, params_overrides: dict):
         chart = db.session.query(Slice).filter_by(slice_name=name).first()
+        import json as _json
         params = {
             "datasource": f"{datasets[ds_key].id}__table",
             "viz_type": viz,
@@ -75,14 +76,14 @@ with app.app_context():
                 viz_type=viz,
                 datasource_type="table",
                 datasource_id=datasets[ds_key].id,
-                params=str(params).replace("'", '"'),
+                params=_json.dumps(params),
                 owners=[admin] if admin else [],
             )
             db.session.add(chart)
             db.session.flush()
             print(f"chart created:  {name}")
         else:
-            chart.params = str(params).replace("'", '"')
+            chart.params = _json.dumps(params)
             print(f"chart exists:   {name}")
         return chart
 
@@ -199,7 +200,8 @@ with app.app_context():
     else:
         print("dashboard exists:  Gaming Lakehouse — Live Overview")
     dash.slices = charts
-    dash.position_json = str(position_json).replace("'", '"')
+    import json as _json
+    dash.position_json = _json.dumps(position_json)
 
     db.session.commit()
     print("\nDone. Open: http://localhost:8088/superset/dashboard/gaming-live-overview/")
