@@ -46,3 +46,6 @@ smoke: ## End-to-end smoke test (make smoke; or SMOKE_DS=2026-10-08 SMOKE_COUNT=
 
 rerun: ## Delete today's dag run and trigger a fresh one (dev convenience)
 	bash scripts/rerun.sh
+
+seed-superset: ## Create/refresh the Superset dashboard (charts + layout; idempotent)
+	docker exec gaming-superset python /app/superset_home/seed.py
