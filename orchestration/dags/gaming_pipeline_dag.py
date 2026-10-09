@@ -32,7 +32,7 @@ import csv
 import io
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import psycopg2
 from airflow import DAG
@@ -113,6 +113,21 @@ def land_raw_kafka_to_rustfs(partition_date: str, **_context) -> dict:
     return summary
 
 
+def _coerce_raw_value(column: str, value):
+    """Map Debezium JSON payload values to the raw column types.
+
+    - Debezium serialises Postgres DATE as days since 1970-01-01 (an int) -
+      convert back to an ISO date string.
+    - event_time_raw arrives as an ISO string and stays one.
+    - Debezium wraps UUIDs as plain strings in JSON mode - pass through.
+    """
+    if value is None:
+        return None
+    if column == "player_signup_date":
+        return (datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(days=int(value))).date()
+    return value
+
+
 def load_raw_to_postgres(partition_date: str, **_context) -> int:
     """Raw-load task: land every NDJSON object for the logical date in the
     warehouse raw schema.
@@ -141,7 +156,7 @@ def load_raw_to_postgres(partition_date: str, **_context) -> int:
                 rows_read += len(records)
                 for rec in records:
                     row = rec.get("after") if isinstance(rec.get("after"), dict) else rec
-                    values = [row.get(col) for col in RAW_COLUMNS]
+                    values = [_coerce_raw_value(col, row.get(col)) for col in RAW_COLUMNS]
                     cur.execute(
                         f"INSERT INTO raw.game_events ({', '.join(RAW_COLUMNS)}, source_partition_date) "
                         f"VALUES ({', '.join(['%s'] * len(RAW_COLUMNS))}, %s) "
@@ -167,9 +182,15 @@ def spark_connectivity_proof(**_context) -> None:
     task = "spark_connectivity_proof"
     _print(task, "start: docker exec gaming-spark-master spark-submit connectivity_proof.py")
     client = docker.from_env()
+    # HOME must point at a writable dir: the Bitnami Spark image resolves the
+    # ivy cache under $HOME/.ivy2 and fails with "basedir must be absolute: ?/.ivy2/local"
+    # when HOME is unset/"/" (as it is for a bare exec without the image's entrypoint).
     result = client.containers.get("gaming-spark-master").exec_run(
-        cmd=["spark-submit", "--master", "local[1]", "/opt/spark-apps/connectivity_proof.py"],
-        user="root",
+        cmd=[
+            "sh", "-c",
+            "export HOME=/opt/bitnami/spark; "
+            "spark-submit --master local[1] /opt/spark-apps/connectivity_proof.py",
+        ],
     )
     output = result.output.decode(errors="replace")
     print(output[-2000:])
@@ -191,13 +212,13 @@ def publish_serving(partition_date: str, **_context) -> None:
     CREATE OR REPLACE VIEW serving.v_player_engagement_daily AS
     SELECT
         p.player_id,
-        p.player_country,
+        p.country,
         COUNT(f.event_id)  AS transactions,
         SUM(f.amount_usd)  AS total_amount_usd,
         MAX(f.event_time)  AS last_txn_at
     FROM curated.fct_in_game_transaction f
     JOIN curated.dim_player p USING (player_id)
-    GROUP BY p.player_id, p.player_country
+    GROUP BY p.player_id, p.country
     """
     conn = psycopg2.connect(settings.postgres.dsn)
     try:

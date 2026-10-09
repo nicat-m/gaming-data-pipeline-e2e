@@ -18,7 +18,7 @@ COPY requirements.txt /tmp/requirements.txt
 # not inside Airflow, and would bloat this image by ~300MB.
 RUN pip install --no-cache-dir \
     "dbt-core==1.8.7" \
-    "dbt-postgres==1.8.7" \
+    "dbt-postgres==1.8.2" \
     "docker==7.1.0" \
     && grep -v -e '^pyspark' -e '^\s*#' -e '^\s*$' /tmp/requirements.txt \
       > /tmp/requirements-airflow.txt \

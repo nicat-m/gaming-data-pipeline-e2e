@@ -13,5 +13,10 @@ dbt_gaming:
       user: "{{ env_var('POSTGRES_USER') }}"
       password: "{{ env_var('POSTGRES_PASSWORD') }}"
       dbname: "{{ env_var('POSTGRES_DB') }}"
-      schema: staging
+      # Base schema for the project's dbt models. dbt's built-in custom-schema
+      # semantics concatenate base + folder override ("public_staging"), which
+      # does NOT match the plain raw/staging/curated schemas created by
+      # infra/postgres/init.sql. A tiny macro (generate_schema_name) maps the
+      # model folder (staging/, curated/) to the plain schema name instead.
+      schema: public
       threads: 4

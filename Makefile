@@ -1,6 +1,7 @@
 COMPOSE := docker compose -f infra/docker-compose.yml --env-file .env
 PYTHON ?= .venv/bin/python
 COUNT ?= 1000
+RATE ?= 5
 BATCH_SIZE ?= 200
 
 .DEFAULT_GOAL := help
@@ -28,8 +29,8 @@ logs: ## Tail logs from all services (Ctrl+C to stop)
 register-connector: ## Register the Debezium CDC connector (one-time, stack must be up)
 	@set -a && . ./.env && set +a && bash infra/kafka-connect/register-connector.sh
 
-generate: ## Write COUNT synthetic events into source Postgres (make generate COUNT=5000)
-	PYTHONPATH=. $(PYTHON) ingestion/producer/db_writer.py --count $(COUNT)
+generate: ## Write COUNT synthetic events into source Postgres (make generate COUNT=5000 RATE=1000)
+	PYTHONPATH=. $(PYTHON) ingestion/producer/db_writer.py --count $(COUNT) --rate $(RATE)
 
 generate-forever: ## Keep writing events until Ctrl+C
 	PYTHONPATH=. $(PYTHON) ingestion/producer/db_writer.py --forever

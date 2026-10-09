@@ -13,6 +13,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 DS="${SMOKE_DS:-$(date -u +%F)}"
 COUNT="${SMOKE_COUNT:-5000}"
+RATE="${SMOKE_RATE:-1000}"   # events/sec: high enough that seeding takes seconds
 EXEC_DATE="${DS}T00:00:00+00:00"
 COMPOSE="docker compose -f infra/docker-compose.yml --env-file .env"
 
@@ -22,7 +23,7 @@ echo "== 1/5 stack health =="
 $COMPOSE ps
 
 echo "== 2/5 seed source (generator -> source Postgres) =="
-make generate COUNT="${COUNT}"
+make generate COUNT="${COUNT}" RATE="${RATE}"
 
 echo "== 3/5 ensure Debezium CDC connector (idempotent) =="
 set -a && . ./.env && set +a
