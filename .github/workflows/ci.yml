@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  lint-compile-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Lint / format check (ruff)
+        run: |
+          pip install ruff==0.6.9
+          ruff check .
+
+      - name: Unit tests
+        run: |
+          pip install -r requirements.txt
+          PYTHONPATH=. pytest -q
+
+      - name: Compile check all pipeline modules
+        run: python -m compileall -q config ingestion transformation orchestration
+
+      - name: Validate infrastructure definition
+        run: docker compose -f infra/docker-compose.yml --env-file .env.example config --quiet

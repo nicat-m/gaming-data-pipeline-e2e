@@ -15,7 +15,7 @@ clean-targets: ["target", "dbt_packages"]
 models:
   dbt_gaming:
     staging:
-      +schema: staging
+      +schema: staging      # macros/generate_schema_name.py uses this name verbatim
       +materialized: view
     curated:
       +schema: curated

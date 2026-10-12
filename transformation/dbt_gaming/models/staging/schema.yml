@@ -2,4 +2,18 @@ version: 2
 
 models:
   - name: stg_game_events
-    description: Phase 0 passthrough of raw.game_events. Tests/columns land in Phase 1.
+    description: >
+      Typed 1:1 staging projection of raw.game_events. Malformed timestamps
+      become NULL event_time (flagged, not dropped). Phase 1 logic is
+      deliberately naive; deeper cleaning is Phase 2 scope.
+    columns:
+      - name: event_id
+        description: Primary key of the event (from the source OLTP table).
+        tests:
+          - not_null      # DQ check 1 - fails the run
+          - unique        # DQ check 2 - fails the run (dedup correctness)
+      - name: event_type
+        description: session_start | session_end | in_game_transaction.
+        tests:
+          - accepted_values:   # DQ check 3 - fails the run
+              values: ["session_start", "session_end", "in_game_transaction"]

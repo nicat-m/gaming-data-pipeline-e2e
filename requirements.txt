@@ -7,12 +7,15 @@ Faker==30.1.0
 python-dotenv==1.0.1
 pydantic==2.9.2
 
-# Warehouse access
+# Source OLTP database access (generator -> source Postgres)
 psycopg2-binary==2.9.9
+
+# Warehouse access (ClickHouse; the OLTP source stays PostgreSQL)
+clickhouse-connect==0.7.19
 
 # Transformation
 dbt-core==1.8.7
-dbt-postgres==1.8.2
+dbt-clickhouse==1.8.1
 pyspark==3.5.3
 
 # Testing
