@@ -18,9 +18,13 @@ envsubst < "${SCRIPT_DIR}/postgres-source-connector.json" > /tmp/postgres-source
 # not - safe to run repeatedly (the smoke test relies on this).
 if curl -sf "${CONNECT_URL}/connectors/${CONNECTOR_NAME}" > /dev/null 2>&1; then
   echo "connector '${CONNECTOR_NAME}' exists - updating config"
+  # PUT /config takes ONLY the config map, not the {"name","config"} wrapper.
+  python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["config"]))' \
+    /tmp/postgres-source-connector.rendered.json > /tmp/postgres-source-connector.config.json
   curl -s -X PUT -H "Content-Type: application/json" \
-    --data @/tmp/postgres-source-connector.rendered.json \
-    "${CONNECT_URL}/connectors/${CONNECTOR_NAME}/config"
+    --data @/tmp/postgres-source-connector.config.json \
+    "${CONNECT_URL}/connectors/${CONNECTOR_NAME}/config" > /dev/null
+  echo "connector config updated"
 else
   echo "registering new connector '${CONNECTOR_NAME}'"
   curl -s -X POST -H "Content-Type: application/json" \
@@ -29,4 +33,4 @@ else
 fi
 echo
 
-rm -f /tmp/postgres-source-connector.rendered.json
+rm -f /tmp/postgres-source-connector.rendered.json /tmp/postgres-source-connector.config.json

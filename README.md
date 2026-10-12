@@ -32,14 +32,15 @@ Component roles (pipeline ↔ component mapping):
 
 | Pipeline role | Component |
 |---|---|
-| Source system | Python generator → source Postgres (`source.game_events`) |
+| Source system #1 (events) | Python generator → source Postgres (`source.game_events`) |
+| Source system #2 (catalog) | FreeToGame public API → Airflow task `fetch_games_api` (ADR 0003) |
 | Ingestion / CDC | Debezium (Kafka Connect) streaming into Kafka |
 | Streaming buffer | Kafka topic `gaming.source.game_events` |
 | Raw landing zone | RustFS bucket (`raw/game_events/dt=<date>/`) — orchestrated consumer task |
 | Warehouse (raw/staging/curated/serving) | ClickHouse + dbt-clickhouse (tests act as the DQ gate) |
 | Batch compute | Spark — connectivity proof now, real S3A job in Phase 3 (ADR 0001) |
 | Orchestration | Airflow `gaming_pipeline` DAG (logical-date parameterised) |
-| Serving | `serving.v_player_engagement_daily` SQL view + CSV report on RustFS |
+| Serving | `serving.v_player_engagement_daily` and `serving.v_game_revenue` SQL views + CSV reports on RustFS |
 | Dashboard | Apache Superset (auto-refresh charts on ClickHouse) |
 | Consumer | Product/Growth team — any SQL client/BI tool; reproducible via repo init SQL |
 
@@ -86,10 +87,13 @@ docker compose -f infra/docker-compose.yml --env-file .env ps   # wait for all s
 # Register the Debezium PostgreSQL source connector (idempotent — safe to re-run)
 make register-connector
 
-# Create the Superset dashboard (idempotent)
-make seed-superset
+# After the FIRST pipeline run (`make smoke`, see below) create the Superset
+# dashboard - its datasets read tables that only exist once the pipeline ran.
+# Idempotent: safe to re-run any time.
+# make seed-superset
 ```
 
+- **Control panel: http://localhost:8099** (`make portal`) — one page with every service link, a health dot and copyable credentials (generated from `.env`, bound to localhost only)
 - Airflow UI: http://localhost:8080 (credentials: `AIRFLOW_ADMIN_USER` / `AIRFLOW_ADMIN_PASSWORD` from `.env`)
 - RustFS console: http://localhost:9001
 - Spark master UI: http://localhost:8081
@@ -131,7 +135,8 @@ SMOKE_DS=2026-10-09 SMOKE_COUNT=5000 make smoke   # explicit logical date
 DAG shape (each stage a separate task, explicit dependencies):
 
 ```
-land_raw_kafka_to_rustfs ─▶ load_raw_to_clickhouse ─▶ dbt_run_staging ─▶ dbt_test_staging ─▶ dbt_run_curated ─▶ publish_serving
+land_raw_kafka_to_rustfs ─▶ load_raw_to_clickhouse ─┐
+fetch_games_api ─▶ load_games_to_clickhouse ────────┴─▶ dbt_run_staging ─▶ dbt_test_staging ─▶ dbt_run_curated ─▶ publish_serving
 spark_connectivity_proof (parallel — Spark integration proof, see docs/decisions/0001)
 ```
 
@@ -175,7 +180,10 @@ make smoke                       # run fails at land_raw_kafka_to_rustfs (Airflo
 PIPELINE_FAIL_SWITCH=0 make up   # back to normal
 ```
 
-**Retries:** the ingestion task retries twice with a 1-minute delay;
+**API outage demo:** set `FREETOGAME_API_URL=http://127.0.0.1:1/x` in `.env`, `make up`, trigger the DAG —
+`fetch_games_api` retries 3× then fails, downstream tasks are skipped, the run is marked failed.
+
+**Retries:** the Kafka ingestion task retries twice and the games-API task three times (1-minute delay);
 all other tasks retry twice (default_args).
 
 **Where to look for logs:** Airflow UI → `gaming_pipeline` → task logs
@@ -246,7 +254,7 @@ Kafka-to-RustFS consumer CLIs, unit-tested.
 dbt_test_staging (DQ gate) → dbt_run_curated → publish_serving`, plus a
 parallel `spark_connectivity_proof` (real S3A batch job = Phase 3, ADR 0001).
 Logical-date parameterised, idempotent re-runs, restart-safe, deliberate
-failure switch (`PIPELINE_FAIL_SWITCH`), 4 DQ checks that can fail the run,
+failure switch (`PIPELINE_FAIL_SWITCH`), 8 DQ checks that can fail the run,
 serving view + CSV report, one-command smoke test (`make smoke`), CI
 workflow (ruff + compile + compose validation). Evidence:
 `docs/evidence/phase-1.md`.

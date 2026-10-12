@@ -56,7 +56,8 @@ qoyub təsiri ölçür. Heç bir mühəndisə "mənə bu cədvəli eksport edər
 > Aşağıdakı mətn diaqramı eyni axının sadə ASCII versiyasıdır.
 
 ```
-Oyun (sintetik generator)                  ──►  Source PostgreSQL (OLTP)
+Oyun (sintetik generator, real oyun ID-ləri) ──►  Source PostgreSQL (OLTP)
+FreeToGame API (real, oyun kataloqu) ──► Airflow: fetch_games_api ──► RustFS ──► raw.games_catalog ──► dim_game
                                                 │  wal_level=logical
                                                 ▼
                                            Debezium (Kafka Connect)  ── CDC ──►  Apache Kafka (topic)
@@ -85,6 +86,8 @@ Oyun (sintetik generator)                  ──►  Source PostgreSQL (OLTP)
                                              ▼
                                   Apache Superset — analitik dashboard (8088)
 ```
+
+**İki mənbə:** (1) event-lər: generator → Postgres → CDC → Kafka; (2) oyun kataloqu: real FreeToGame API. İkisi staging/curated qatında `game_id` ilə birləşir (oyun/janr üzrə gəlir).
 
 **Əsas ideya:** hadisələr **axınla** (CDC) Kafka-ya çatıır; Airflow isə hər gün
 (əl ilə də trigger oluna bilər) **batch** kəsimini işə salır: Kafka → RustFS →
@@ -181,6 +184,8 @@ keçməsə, downstream tasklar skip olunur və run `failed` işarələnir. Mövc
 2. `unique(stg_game_events.event_id)` — dedup doğruluğu
 3. `accepted_values(event_type ∈ {session_start, session_end, in_game_transaction})`
 4. `assert_staging_has_rows` (singular test) — boş raw üzərində run yayımlanmır
+5. `not_null` + `unique` `stg_games.game_id`, `not_null` `stg_games.title` — API kataloqunun bütövlüyü
+6. `assert_games_catalog_has_rows` — API boş qaytarsa run dayanır
 
 Bunlardan biri uğursuz olsa run **failed** olur. Qeyd: `schema.yml`-də curated
 modellər üçün də `not_null/unique` testləri təyin olunub (`dim_player.player_id`,
@@ -200,7 +205,8 @@ bilmək üçün komanda tarixçəsinə baxmaq kifayətdir** və köhnə günü y
 ### 3.7 Airflow task qrafı
 
 ```
-land_raw_kafka_to_rustfs ─► load_raw_to_clickhouse ─► dbt_run_staging ─► dbt_test_staging ─► dbt_run_curated ─► publish_serving
+land_raw_kafka_to_rustfs ─► load_raw_to_clickhouse ─┐
+fetch_games_api ─► load_games_to_clickhouse ───────┴─► dbt_run_staging ─► dbt_test_staging ─► dbt_run_curated ─► publish_serving
 spark_connectivity_proof (paralel)
 ```
 
@@ -209,7 +215,13 @@ spark_connectivity_proof (paralel)
   taskının sonsuz qalmaması üçündür.
 - **PIPELINE_FAIL_SWITCH=1** (.env-də): qəsdən xəta demo — ingestion taskı
   `AirflowFailException` atır, hamı downstream skip. Reviewer üçün sənədləşdirilib.
-- Retry siyasəti: bütün tasklar 2 dəfə, 1 dəqiqə fəslə ilə.
+- **fetch_games_api** (ikinci mənbə): real FreeToGame API-dən (`https://www.freetogame.com/api/games`,
+  açar tələb etmir) oyun kataloqunu çəkir: timeout, 3 daxili cəhd (backoff) və Airflow
+  səviyyəsində 3 retry. Cavab validasiya olunur (`id`, `title` məcburi), RustFS-ə
+  `raw/games_catalog/dt=<ds>/games.jsonl` kimi yazılır. API düşərsə run uğursuz olur
+  (sınaq: `.env`-də `FREETOGAME_API_URL=http://127.0.0.1:1/x`). Qərarın əsası: `docs/decisions/0003-games-api-second-source.md`.
+- **load_games_to_clickhouse**: `raw.games_catalog`-a delete-then-insert (həmin tarix üçün).
+- Retry siyasəti: Kafka task-ı 2, games API task-ı 3, qalanları 2 dəfə; hamısı 1 dəqiqə fasilə ilə.
 
 ### 3.8 Spark: niyə hələlik yalnız connectivity proof?
 
@@ -240,12 +252,17 @@ Phase 3-dür (RustFS-dən oxuyub `agg_player_daily_engagement` yazır); Phase 1-
 
 | Qat | Obyekt | Dənə (1 sətir =) | Əsas sütunlar |
 |---|---|---|---|
-| Source | `source.game_events` (Postgres) | 1 event | `event_id` (PK), `event_type`, tarix, oyunçu/cihaz/oyun sahələri |
+| Source #1 | `source.game_events` (Postgres) | 1 event | `event_id` (PK), `event_type`, tarix, oyunçu/cihaz/oyun sahələri |
+| Source #2 | FreeToGame API (`/api/games`) | 1 oyun | `id`, `title`, `genre`, `platform`, `publisher`... |
 | Raw | `raw.game_events` | 1 event | mənbə sütunları + `source_partition_date`, `loaded_at` |
 | Staging | `staging.stg_game_events` (view) | 1 event | tipləşdirilmiş `event_time` (pozuqsa NULL), `player_signup_date` (Date) |
+| Raw (API) | `raw.games_catalog` | 1 oyun / gün snapshot | `game_id`, `title`, `genre`, `publisher`, `source_partition_date` |
+| Staging (API) | `staging.stg_games` (view) | 1 oyun (son snapshot) | tipləşdirilmiş `release_date` |
+| Curated | `curated.dim_game` | 1 oyun | `game_id`, `title`, `genre`, `platform`, `publisher` (SCD1) |
 | Curated | `curated.dim_player` | 1 oyunçu | `player_id`, `display_name`, `country`, `signup_date` (SCD1: son dəyər qalib) |
-| Curated | `curated.fct_in_game_transaction` | 1 alış-veriş | `event_id`, `player_id`, `session_id`, `amount_usd`, `currency`, `event_time` |
+| Curated | `curated.fct_in_game_transaction` | 1 alış-veriş | `event_id`, `player_id`, `game_id`, `session_id`, `amount_usd`, `currency`, `event_time` |
 | Serving | `serving.v_player_engagement_daily` (view) | oyunçu × ölkə | `transactions`, `total_amount_usd`, `last_txn_at` |
+| Serving | `serving.v_game_revenue` (view) | oyun | `title`, `genre`, `publisher`, `transactions`, `paying_players`, `revenue_usd` |
 
 Phase 1-də naiv qərarlar (sənədləşdirilmiş TODO): mənfi məbləğlər fact-da saxlanır,
 `dim_player` SCD2 deyil.
@@ -275,7 +292,7 @@ canlı yenilənir (mənbə: ClickHouse-dan birbaşa sorğu — sürətli, saniy�
 
 1. `make up` — `superset-init` konteyneri migrasiyanı edir, admin istifadəçi yaradır
    (login: `.env`-də `SUPERSET_ADMIN_USER` / `SUPERSET_ADMIN_PASSWORD`).
-2. `make seed-superset` — [scripts/superset_seed.py](../../scripts/superset_seed.py)
+2. **Pipeline ilk dəfə işlədikdən sonra** (`make smoke`) `make seed-superset` — dataset-lər pipeline-ın yaratdığı cədvəllərdən oxuyur, onlar olmadan chart-lar boş çıxır. [scripts/superset_seed.py](../../scripts/superset_seed.py)
    ClickHouse bağlantısını, dataset-ləri, 6 chart-ı və
    "Gaming Lakehouse — Live Overview" dashboard-unu yaradır (idempotent).
 3. Aç: `http://localhost:8088`.
@@ -315,7 +332,7 @@ pip install -r requirements.txt            # make generate / make smoke bunu ist
 make up                                    # stack qalxır (ilk dəfə Airflow image build ~3-5 dəq)
 make ps                                    # hamısı "healthy" olana qədər gözlə
 make register-connector                    # Debezium CDC (idempotent)
-make seed-superset                         # dashboard (idempotent)
+# make seed-superset  → pipeline ilk dəfə işlədikdən SONRA (aşağıya bax)
 ```
 
 ### 5.3 Pipeline-ı işə salmaq

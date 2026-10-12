@@ -3,10 +3,13 @@ Gaming Lakehouse batch pipeline - Phase 1 walking skeleton.
 
     land_raw_kafka_to_rustfs            (ingestion: Kafka -> RustFS raw zone)
         -> load_raw_to_clickhouse       (raw: RustFS -> ClickHouse raw database)
-        -> dbt_run_staging              (staging: typed/cleaned 1:1 models)
+    fetch_games_api                     (ingestion #2: FreeToGame API -> RustFS raw zone)
+        -> load_games_to_clickhouse     (raw: RustFS -> raw.games_catalog)
+        both feed:
+        -> dbt_run_staging              (staging: typed/cleaned models)
         -> dbt_test_staging             (DQ checks - failure blocks downstream)
-        -> dbt_run_curated              (curated: dim_player, fct_in_game_transaction)
-        -> publish_serving              (serving: SQL view + CSV report on RustFS)
+        -> dbt_run_curated              (curated: dim_player, dim_game, fct_in_game_transaction)
+        -> publish_serving              (serving: SQL views + CSV reports on RustFS)
 
     spark_connectivity_proof            (parallel: proves the Spark cluster is
                                          integrated; the real S3A batch job is
@@ -23,7 +26,7 @@ recreate the containers, then trigger the DAG - the ingestion task raises
 AirflowFailException, the run is marked failed and every downstream task is
 skipped. Remove the variable (or set 0) and re-trigger to go back to normal.
 
-Retries: the ingestion task retries up to 2 times with a 1-minute delay;
+Retries: the ingestion tasks retry (Kafka: 2x, games API: 3x) with a 1-minute delay;
 all other tasks retry twice (see default_args).
 """
 from __future__ import annotations
@@ -70,6 +73,30 @@ ENGINE = ReplacingMergeTree
 ORDER BY (source_partition_date, event_id)
 """
 
+
+GAMES_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS raw.games_catalog
+(
+    game_id               String,
+    title                 String,
+    genre                 Nullable(String),
+    platform              Nullable(String),
+    publisher             Nullable(String),
+    developer             Nullable(String),
+    release_date          Nullable(String),
+    short_description     Nullable(String),
+    game_url              Nullable(String),
+    source_partition_date String,
+    loaded_at             DateTime DEFAULT now()
+)
+ENGINE = ReplacingMergeTree
+ORDER BY (source_partition_date, game_id)
+"""
+
+GAMES_COLUMNS = [
+    "game_id", "title", "genre", "platform", "publisher", "developer",
+    "release_date", "short_description", "game_url",
+]
 
 RAW_COLUMNS = [
     "event_id", "event_type", "event_time_raw", "session_id", "amount_usd",
@@ -200,6 +227,58 @@ def load_raw_to_clickhouse(partition_date: str, **_context) -> int:
     return rows_inserted
 
 
+def fetch_games_api(partition_date: str, **_context) -> dict:
+    """Ingestion task #2: pull the game catalog from the external FreeToGame
+    API and land it in the RustFS raw zone (raw/games_catalog/dt=<ds>/games.jsonl).
+
+    Idempotency: deterministic object key per logical date (overwrite).
+    A failing/unreachable API raises -> Airflow retries (3x, 1 min) -> run fails.
+    """
+    from ingestion.api.freetogame import GamesApiError, land_games
+
+    task = "fetch_games_api"
+    _print(task, f"start: input={settings.games_api.url} "
+                 f"output=s3://{settings.rustfs.raw_bucket}/raw/games_catalog/dt={partition_date}/")
+    try:
+        summary = land_games(partition_date)
+    except GamesApiError as exc:
+        raise RuntimeError(f"games API ingestion failed: {exc}") from exc
+    _print(task, f"end: rows_read={summary['rows_read']} rows_written={summary['rows_written']} "
+                 f"rows_rejected={summary['rows_rejected']} key={summary['key']}")
+    return summary
+
+
+def load_games_to_clickhouse(partition_date: str, **_context) -> int:
+    """Raw-load task #2: RustFS games.jsonl -> raw.games_catalog.
+
+    Idempotency: delete-then-insert for the logical date's partition.
+    """
+    task = "load_games_to_clickhouse"
+    key = f"raw/games_catalog/dt={partition_date}/games.jsonl"
+    s3 = _get_s3_client()
+    _print(task, f"start: input=s3://{settings.rustfs.raw_bucket}/{key} output=raw.games_catalog")
+    body = s3.get_object(Bucket=settings.rustfs.raw_bucket, Key=key)["Body"].read()
+    records = [json.loads(line) for line in body.splitlines() if line.strip()]
+
+    client = _get_clickhouse_client()
+    client.command(GAMES_TABLE_DDL)
+    client.command(
+        "ALTER TABLE raw.games_catalog DELETE WHERE source_partition_date = %(ds)s "
+        "SETTINGS mutations_sync = 2",
+        parameters={"ds": partition_date},
+    )
+    rows = []
+    for rec in records:
+        values = [None if rec.get(c) is None else str(rec.get(c)) for c in
+                  ("id", "title", "genre", "platform", "publisher", "developer",
+                   "release_date", "short_description", "game_url")]
+        rows.append((*values, partition_date))
+    if rows:
+        client.insert("raw.games_catalog", rows, column_names=[*GAMES_COLUMNS, "source_partition_date"])
+    _print(task, f"end: rows_read={len(records)} rows_inserted={len(rows)}")
+    return len(rows)
+
+
 def spark_connectivity_proof(**_context) -> None:
     """Connectivity proof for the Spark component (Phase 1): run a trivial
     spark-submit inside the Spark container. The real S3A batch job is
@@ -228,42 +307,61 @@ def spark_connectivity_proof(**_context) -> None:
 
 
 def publish_serving(partition_date: str, **_context) -> None:
-    """Serving task: expose one curated object for consumers - a SQL view
-    (`serving.v_player_engagement_daily`, queryable by Superset / any SQL
-    client) and a CSV report exported to RustFS under serving/.
+    """Serving task: expose curated objects for consumers - SQL views
+    (`serving.v_player_engagement_daily`, `serving.v_game_revenue`, queryable
+    by Superset / any SQL client) and a CSV report per view exported to RustFS
+    under serving/<view>/dt=<ds>/report.csv.
 
-    Idempotency: CREATE OR REPLACE VIEW + deterministic report object key
-    (dt=<ds>/report.csv) make re-runs overwrite instead of duplicate.
+    Idempotency: CREATE OR REPLACE VIEW + deterministic report object keys
+    make re-runs overwrite instead of duplicate.
     """
     task = "publish_serving"
-    view_sql = """
-    CREATE OR REPLACE VIEW serving.v_player_engagement_daily AS
-    SELECT
-        f.player_id              AS player_id,
-        p.country                AS country,
-        count(f.event_id)        AS transactions,
-        sum(f.amount_usd)        AS total_amount_usd,
-        max(f.event_time)        AS last_txn_at
-    FROM curated.fct_in_game_transaction f
-    JOIN curated.dim_player p USING (player_id)
-    GROUP BY f.player_id, p.country
-    """
+    views = {
+        "v_player_engagement_daily": """
+            CREATE OR REPLACE VIEW serving.v_player_engagement_daily AS
+            SELECT
+                f.player_id              AS player_id,
+                p.country                AS country,
+                count(f.event_id)        AS transactions,
+                sum(f.amount_usd)        AS total_amount_usd,
+                max(f.event_time)        AS last_txn_at
+            FROM curated.fct_in_game_transaction f
+            JOIN curated.dim_player p USING (player_id)
+            GROUP BY f.player_id, p.country
+        """,
+        # Game-level revenue: fact joined to the API-sourced game dimension.
+        "v_game_revenue": """
+            CREATE OR REPLACE VIEW serving.v_game_revenue AS
+            SELECT
+                g.game_id                AS game_id,
+                g.title                  AS title,
+                g.genre                  AS genre,
+                g.publisher              AS publisher,
+                g.platform               AS platform,
+                count(f.event_id)        AS transactions,
+                uniq(f.player_id)        AS paying_players,
+                sum(f.amount_usd)        AS revenue_usd
+            FROM curated.fct_in_game_transaction f
+            JOIN curated.dim_game g ON f.game_id = g.game_id
+            GROUP BY g.game_id, g.title, g.genre, g.publisher, g.platform
+        """,
+    }
     client = _get_clickhouse_client()
     client.command("CREATE DATABASE IF NOT EXISTS serving")
-    client.command(view_sql)
-    rows = client.query("SELECT * FROM serving.v_player_engagement_daily")
-    columns = rows.column_names
-
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(columns)
-    writer.writerows(rows.result_rows)
-    key = f"serving/player_engagement_daily/dt={partition_date}/report.csv"
     s3 = _get_s3_client()
-    s3.put_object(Bucket=settings.rustfs.raw_bucket, Key=key, Body=buf.getvalue().encode(), ContentType="text/csv")
-    _print(task, f"start: input=curated database output=serving.v_player_engagement_daily "
-                 f"+ s3://{settings.rustfs.raw_bucket}/{key}")
-    _print(task, f"end: rows_published={len(rows.result_rows)}")
+    for name, view_sql in views.items():
+        client.command(view_sql)
+        rows = client.query(f"SELECT * FROM serving.{name}")
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(rows.column_names)
+        writer.writerows(rows.result_rows)
+        key = f"serving/{name.removeprefix('v_')}/dt={partition_date}/report.csv"
+        s3.put_object(Bucket=settings.rustfs.raw_bucket, Key=key,
+                      Body=buf.getvalue().encode(), ContentType="text/csv")
+        _print(task, f"start: input=curated database output=serving.{name} "
+                     f"+ s3://{settings.rustfs.raw_bucket}/{key}")
+        _print(task, f"end: rows_published={len(rows.result_rows)}")
 
 
 def _get_clickhouse_client():
@@ -288,8 +386,8 @@ def _get_s3_client():
 with DAG(
     dag_id="gaming_pipeline",
     description=(
-        "Postgres(source) -> Debezium/Kafka -> RustFS(raw) -> Postgres(raw) "
-        "-> dbt staging/curated -> serving view + CSV report"
+        "Postgres(source) -> Debezium/Kafka + FreeToGame API -> RustFS(raw) -> ClickHouse(raw) "
+        "-> dbt staging/curated -> serving views + CSV reports"
     ),
     start_date=datetime(2026, 1, 1),
     schedule="@daily",          # declared schedule; DAG ships paused
@@ -307,6 +405,20 @@ with DAG(
     load_raw = PythonOperator(
         task_id="load_raw_to_clickhouse",
         python_callable=load_raw_to_clickhouse,
+        op_kwargs={"partition_date": "{{ ds }}"},
+    )
+
+    fetch_games = PythonOperator(
+        task_id="fetch_games_api",
+        python_callable=fetch_games_api,
+        op_kwargs={"partition_date": "{{ ds }}"},
+        retries=3,                       # external API: more tolerant than the Kafka task
+        retry_delay=timedelta(minutes=1),
+    )
+
+    load_games = PythonOperator(
+        task_id="load_games_to_clickhouse",
+        python_callable=load_games_to_clickhouse,
         op_kwargs={"partition_date": "{{ ds }}"},
     )
 
@@ -348,5 +460,8 @@ with DAG(
         op_kwargs={"partition_date": "{{ ds }}"},
     )
 
-    land_raw >> load_raw >> dbt_run_staging >> dbt_test_staging >> dbt_run_curated >> publish
+    land_raw >> load_raw
+    fetch_games >> load_games
+    [load_raw, load_games] >> dbt_run_staging
+    dbt_run_staging >> dbt_test_staging >> dbt_run_curated >> publish
     spark_proof

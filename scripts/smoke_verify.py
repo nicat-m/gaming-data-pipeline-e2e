@@ -58,6 +58,22 @@ def main() -> int:
         "WHERE event_type = 'in_game_transaction' AND event_time IS NOT NULL"
     ).result_rows[0][0]
 
+    # --- second source: external games API -> raw.games_catalog -> stg_games -> dim_game
+    games_raw_ds = client.query(
+        f"SELECT count(*) FROM raw.games_catalog WHERE source_partition_date = '{ds}'"
+    ).result_rows[0][0]
+    games_latest_distinct = client.query(
+        "SELECT uniq(game_id) FROM raw.games_catalog "
+        "WHERE source_partition_date = (SELECT max(source_partition_date) FROM raw.games_catalog)"
+    ).result_rows[0][0]
+    games_stg = client.query("SELECT count(*) FROM staging.stg_games").result_rows[0][0]
+    games_dim = client.query("SELECT count(*) FROM curated.dim_game").result_rows[0][0]
+    fct_matched = client.query(
+        "SELECT count(*) FROM curated.fct_in_game_transaction f "
+        "INNER JOIN curated.dim_game g ON f.game_id = g.game_id"
+    ).result_rows[0][0]
+    game_revenue_rows = client.query("SELECT count(*) FROM serving.v_game_revenue").result_rows[0][0]
+
     from ingestion.consumer.kafka_to_rustfs import _get_s3_client
 
     s3 = _get_s3_client()
@@ -81,6 +97,12 @@ def main() -> int:
     print(f"curated.dim_player          | {dim_count}")
     print(f"serving view rows           | {serving_count}")
     print(f"serving CSV report          | {report_key} exists={report_exists}")
+    print(f"raw.games_catalog (ds={ds}) | {games_raw_ds}   (API source)")
+    print(f"staging.stg_games           | {games_stg}")
+    print(f"curated.dim_game            | {games_dim}")
+    print(f"  fact rows matched to game | {fct_matched} of {fct_count} "
+          f"(unmatched = events with ids outside the catalog)")
+    print(f"serving v_game_revenue rows | {game_revenue_rows}")
     print("raw rows per logical date   | date: rows (distinct events)")
     for d, n, u in raw_by_date:
         print(f"  {d}                | {n} ({u})")
@@ -104,6 +126,16 @@ def main() -> int:
         failures.append(f"staging total ({staging_count}) != raw distinct total ({raw_distinct})")
     if fct_count != expected_fct:
         failures.append(f"fct ({fct_count}) != expected ({expected_fct})")
+    if games_raw_ds == 0:
+        failures.append(f"raw.games_catalog has no rows for ds={ds} (games API ingestion)")
+    if games_dim != games_latest_distinct or games_stg != games_dim:
+        failures.append(
+            f"games: raw distinct {games_latest_distinct} / staging {games_stg} / dim_game {games_dim} must match"
+        )
+    if fct_matched == 0:
+        failures.append("no fact row joins to dim_game: game_id in events does not match the API catalog")
+    if game_revenue_rows == 0:
+        failures.append("serving.v_game_revenue is empty")
     if dim_count == 0:
         failures.append("dim_player is empty")
     if serving_count == 0:

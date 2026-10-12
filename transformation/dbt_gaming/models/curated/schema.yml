@@ -19,3 +19,11 @@ models:
       - name: player_id
         tests:
           - not_null
+
+  - name: dim_game
+    description: One row per game from the external game-catalog API (SCD1).
+    columns:
+      - name: game_id
+        tests:
+          - not_null
+          - unique

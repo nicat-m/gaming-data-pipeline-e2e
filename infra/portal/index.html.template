@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gaming Lakehouse — Control Panel</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --line:#334155; --txt:#e2e8f0; --mut:#94a3b8; --acc:#38bdf8; --ok:#22c55e; --bad:#ef4444; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--txt); }
+  header { padding:28px 32px 8px; }
+  h1 { margin:0 0 4px; font-size:24px; }
+  header p { margin:0; color:var(--mut); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(360px,1fr)); gap:16px; padding:20px 32px 40px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 18px; display:flex; flex-direction:column; gap:10px; }
+  .top { display:flex; align-items:center; gap:10px; }
+  .top img { width:28px; height:28px; }
+  .top .ph { width:28px; height:28px; border-radius:6px; background:var(--line); display:grid; place-items:center; font-weight:700; color:var(--acc); }
+  .top h2 { margin:0; font-size:16px; flex:1; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--mut); }
+  .dot.up { background:var(--ok); } .dot.down { background:var(--bad); }
+  .desc { color:var(--mut); font-size:13px; }
+  a.open { display:inline-block; background:var(--acc); color:#04243a; text-decoration:none; font-weight:600; padding:7px 12px; border-radius:8px; align-self:flex-start; }
+  a.open:hover { filter:brightness(1.1); }
+  .row { display:flex; align-items:center; gap:8px; background:#0b1220; border:1px solid var(--line); border-radius:8px; padding:5px 6px 5px 10px; }
+  .row .k { color:var(--mut); width:74px; flex:none; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  .row .v { flex:1; font-family:ui-monospace,Menlo,Consolas,monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .row .v.secret { filter:blur(5px); transition:filter .15s; cursor:pointer; }
+  .row .v.secret.show { filter:none; }
+  button { background:transparent; color:var(--acc); border:1px solid var(--line); border-radius:6px; padding:4px 9px; cursor:pointer; font-size:12px; }
+  button:hover { background:var(--line); }
+  button.done { color:var(--ok); border-color:var(--ok); }
+  footer { padding:0 32px 30px; color:var(--mut); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Gaming Lakehouse — Control Panel</h1>
+  <p>All services in one place. Click <b>Open</b> to go to a service, <b>Copy</b> to copy a value. Passwords are blurred until you click them.</p>
+</header>
+<main class="grid" id="grid"></main>
+<footer>Local development only. This page is generated from your <code>.env</code> at container start and is bound to 127.0.0.1. Do not expose it.</footer>
+
+<script>
+const ICON = s => "https://cdn.simpleicons.org/" + s;
+const SERVICES = [
+  { name:"Apache Superset", icon:ICON("apachesuperset/20A6C9"), url:"http://localhost:8088/superset/dashboard/gaming-live-overview/", health:"http://localhost:8088/health",
+    desc:"BI dashboard (6 charts) on the ClickHouse warehouse.",
+    rows:[["User","${SUPERSET_ADMIN_USER}"],["Password","${SUPERSET_ADMIN_PASSWORD}",1]] },
+  { name:"Apache Airflow", icon:ICON("apacheairflow/017CEE"), url:"http://localhost:8080/dags/gaming_pipeline/grid", health:"http://localhost:8080/health",
+    desc:"Orchestrator: DAG gaming_pipeline (trigger, runs, task logs).",
+    rows:[["User","${AIRFLOW_ADMIN_USER}"],["Password","${AIRFLOW_ADMIN_PASSWORD}",1]] },
+  { name:"Kafka UI", icon:ICON("apachekafka/E2E8F0"), url:"http://localhost:8085", health:"http://localhost:8085",
+    desc:"Topics, messages and the Debezium connector. No login.",
+    rows:[["Bootstrap","localhost:9092"],["Topic","gaming.source.game_events"]] },
+  { name:"ClickHouse", icon:ICON("clickhouse/FFCC01"), url:"http://localhost:8123/play", health:"http://localhost:8123/ping",
+    desc:"Warehouse (raw / staging / curated / serving). Query it in the Play UI.",
+    rows:[["User","${CLICKHOUSE_USER}"],["Password","${CLICKHOUSE_PASSWORD}",1],["Database","${CLICKHOUSE_DB}"],["HTTP","localhost:8123"],["Native","localhost:9004"]] },
+  { name:"Source PostgreSQL", icon:ICON("postgresql/4169E1"), url:null,
+    desc:"OLTP source table source.game_events (CDC-enabled). Connect with any SQL client.",
+    rows:[["Host","localhost"],["Port","5433"],["Database","${SOURCE_POSTGRES_DB}"],["User","${SOURCE_POSTGRES_USER}"],["Password","${SOURCE_POSTGRES_PASSWORD}",1],["URL","postgresql://${SOURCE_POSTGRES_USER}:${SOURCE_POSTGRES_PASSWORD}@localhost:5433/${SOURCE_POSTGRES_DB}",1]] },
+  { name:"RustFS (S3)", icon:null, letter:"S3", url:"http://localhost:9001", health:"http://localhost:9001",
+    desc:"Object storage: raw landing zone and CSV reports. Console on :9001.",
+    rows:[["Access key","${RUSTFS_ACCESS_KEY}"],["Secret key","${RUSTFS_SECRET_KEY}",1],["Bucket","${RUSTFS_RAW_BUCKET}"],["S3 endpoint","http://localhost:9000"]] },
+  { name:"Kafka Connect (Debezium)", icon:null, letter:"CDC", url:"http://localhost:8083/connectors?expand=status", health:"http://localhost:8083",
+    desc:"REST API of the Debezium PostgreSQL connector. No login.",
+    rows:[["REST","http://localhost:8083"],["Connector","gaming-postgres-source-connector"]] },
+  { name:"Spark Master", icon:ICON("apachespark/E25A1C"), url:"http://localhost:8081", health:"http://localhost:8081",
+    desc:"Spark cluster UI (connectivity proof; real batch job is Phase 3). No login.",
+    rows:[["Master URL","spark://localhost:7077"]] },
+];
+
+const grid = document.getElementById("grid");
+function copy(text, btn) {
+  const ok = () => { const t = btn.textContent; btn.textContent = "Copied"; btn.classList.add("done");
+    setTimeout(() => { btn.textContent = t; btn.classList.remove("done"); }, 1200); };
+  if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(text).then(ok); return; }
+  const ta = document.createElement("textarea"); ta.value = text; document.body.appendChild(ta);
+  ta.select(); document.execCommand("copy"); ta.remove(); ok();
+}
+for (const s of SERVICES) {
+  const card = document.createElement("section"); card.className = "card";
+  const top = document.createElement("div"); top.className = "top";
+  if (s.icon) { const i = document.createElement("img"); i.src = s.icon; i.alt = ""; top.appendChild(i); }
+  else { const p = document.createElement("div"); p.className = "ph"; p.textContent = s.letter || "?"; top.appendChild(p); }
+  const h = document.createElement("h2"); h.textContent = s.name; top.appendChild(h);
+  const dot = document.createElement("span"); dot.className = "dot"; dot.title = s.health ? "checking…" : "no HTTP health check"; top.appendChild(dot);
+  card.appendChild(top);
+  const d = document.createElement("div"); d.className = "desc"; d.textContent = s.desc; card.appendChild(d);
+  if (s.url) { const a = document.createElement("a"); a.className = "open"; a.href = s.url; a.target = "_blank"; a.rel = "noopener"; a.textContent = "Open ↗"; card.appendChild(a); }
+  for (const [k, v, secret] of s.rows) {
+    const r = document.createElement("div"); r.className = "row";
+    const kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    const vv = document.createElement("span"); vv.className = "v" + (secret ? " secret" : ""); vv.textContent = v; vv.title = v;
+    if (secret) vv.onclick = () => vv.classList.toggle("show");
+    const b = document.createElement("button"); b.textContent = "Copy"; b.onclick = () => copy(v, b);
+    r.append(kk, vv, b); card.appendChild(r);
+  }
+  grid.appendChild(card);
+  if (s.health) {
+    const c = new AbortController(); const t = setTimeout(() => c.abort(), 4000);
+    // no-cors: we only need "reachable or not", not the response body
+    fetch(s.health, { mode:"no-cors", signal:c.signal }).then(() => { dot.className = "dot up"; dot.title = "reachable"; })
+      .catch(() => { dot.className = "dot down"; dot.title = "not reachable"; }).finally(() => clearTimeout(t));
+  }
+}
+</script>
+</body>
+</html>

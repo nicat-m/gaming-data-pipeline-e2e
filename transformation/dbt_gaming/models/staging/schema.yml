@@ -17,3 +17,15 @@ models:
         tests:
           - accepted_values:   # DQ check 3 - fails the run
               values: ["session_start", "session_end", "in_game_transaction"]
+
+  - name: stg_games
+    description: >
+      Latest snapshot of the FreeToGame catalog (external API source), typed.
+    columns:
+      - name: game_id
+        tests:
+          - not_null      # DQ check 5 - fails the run
+          - unique        # DQ check 6 - fails the run
+      - name: title
+        tests:
+          - not_null      # DQ check 7 - fails the run
