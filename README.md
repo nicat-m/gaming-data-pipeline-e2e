@@ -26,6 +26,8 @@ flowchart LR
     CUR --> VIEWS[Serving: SQL view + CSV report ✅]
 ```
 
+Detailed data-flow diagram (icons, formats, parsing per stage): [`docs/architecture/architecture.png`](docs/architecture/architecture.png) (editable source: [`architecture.drawio`](docs/architecture/architecture.drawio)).
+
 Component roles (pipeline ↔ component mapping):
 
 | Pipeline role | Component |

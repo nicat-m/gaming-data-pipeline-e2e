@@ -49,6 +49,12 @@ qoyub təsiri ölçür. Heç bir mühəndisə "mənə bu cədvəli eksport edər
 
 ## 2. ARXİTEKTURA (böyük şəkil)
 
+![Arxitektura və data axını](../architecture/architecture.png)
+
+> Redaktə oluna bilən mənbə: [architecture.drawio](../architecture/architecture.drawio)
+> (draw.io / diagrams.net-də aç, dəyişiklikdən sonra File → Export as → PNG ilə `architecture.png`-ni yenilə).
+> Aşağıdakı mətn diaqramı eyni axının sadə ASCII versiyasıdır.
+
 ```
 Oyun (sintetik generator)                  ──►  Source PostgreSQL (OLTP)
                                                 │  wal_level=logical
