@@ -376,3 +376,10 @@ docker compose -f infra/docker-compose.yml --env-file .env down -v
   `cp .env.example .env`), README/evidence were corrected to match the
   ClickHouse implementation (idempotency via ReplacingMergeTree + FINAL,
   not ON CONFLICT), and the unused warehouse-Postgres init script was removed.
+
+- **2026-10-12 — Second source: game-catalog API:** added the FreeToGame
+  public API as a real second source feeding `dim_game` and the
+  `v_game_revenue` serving view; the generator now emits real catalog ids.
+  Kept the generator for player events (the CDC path and the player-level
+  business questions need it). See ADR
+  `docs/decisions/0003-games-api-second-source.md`. DQ checks: 4 → 8.

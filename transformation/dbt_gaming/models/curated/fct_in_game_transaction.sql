@@ -8,6 +8,7 @@ select
     event_id,
     session_id,
     player_id,
+    game_id,
     amount_usd,
     currency,
     event_time,

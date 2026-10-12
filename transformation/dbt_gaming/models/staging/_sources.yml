@@ -9,3 +9,8 @@ sources:
     tables:
       - name: game_events
         description: One row per raw Kafka game event, loaded as-is (no cleaning).
+      - name: games_catalog
+        description: >
+          Game catalog from the external FreeToGame API, one snapshot per
+          logical date (source_partition_date), loaded by the Airflow task
+          "load_games_to_clickhouse".

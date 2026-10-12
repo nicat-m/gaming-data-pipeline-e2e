@@ -20,7 +20,7 @@ up: ## Start the full infrastructure in the background (incl. first-boot setup)
 	@$(COMPOSE) ps
 	@echo ">> control panel (all URLs + copyable credentials): http://localhost:8099"
 	@echo ">> next: make smoke  (or the manual steps in README)"
-	@echo ">> if this is the FIRST boot: make register-connector && make seed-superset"
+	@echo ">> FIRST boot: make register-connector, run the pipeline (make smoke), THEN make seed-superset"
 
 down: ## Stop the stack, keep data (named volumes persist)
 	$(COMPOSE) down

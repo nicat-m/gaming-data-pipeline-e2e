@@ -26,10 +26,21 @@ from ingestion.schemas import Device, EventType, GameEvent, GameTitle, Player
 
 fake = Faker()
 
+# Real titles from the FreeToGame catalog (https://www.freetogame.com/api/games):
+# game_id is the catalog's numeric id, so events join the API-sourced dim_game.
+# The generator stays offline/deterministic; the catalog itself is fetched
+# by the Airflow task `fetch_games_api`.
 _GAMES = [
-    GameTitle(game_id="g-001", game_name="Starforge Legends", genre="strategy"),
-    GameTitle(game_id="g-002", game_name="Neon Drift Racer", genre="racing"),
-    GameTitle(game_id="g-003", game_name="Puzzle Kingdoms", genre="puzzle"),
+    GameTitle(game_id="540", game_name="Overwatch", genre="Shooter"),
+    GameTitle(game_id="516", game_name="PUBG: BATTLEGROUNDS", genre="Shooter"),
+    GameTitle(game_id="590", game_name="Throne And Liberty", genre="MMORPG"),
+    GameTitle(game_id="523", game_name="Fall Guys", genre="Battle Royale"),
+    GameTitle(game_id="340", game_name="Game Of Thrones Winter Is Coming", genre="Strategy"),
+    GameTitle(game_id="475", game_name="Genshin Impact", genre="Action RPG"),
+    GameTitle(game_id="521", game_name="Diablo Immortal", genre="MMOARPG"),
+    GameTitle(game_id="517", game_name="Lost Ark", genre="ARPG"),
+    GameTitle(game_id="212", game_name="Brawlhalla", genre="Fighting"),
+    GameTitle(game_id="625", game_name="Superball", genre="Sports"),
 ]
 
 _PLATFORMS = ["android", "ios", "pc", "web"]

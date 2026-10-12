@@ -54,6 +54,7 @@ with app.app_context():
         ("curated", "dim_player"),
         ("curated", "fct_in_game_transaction"),
         ("serving", "v_player_engagement_daily"),
+        ("serving", "v_game_revenue"),
     ]
     datasets: dict[str, SqlaTable] = {}
     for schema, table in wanted_datasets:
@@ -206,6 +207,39 @@ with app.app_context():
                 "y_axis_format": "SMART_NUMBER",
             },
         ),
+        make_chart(
+            "revenue_by_genre",
+            "Revenue by game genre",
+            "echarts_timeseries_bar",
+            "serving.v_game_revenue",
+            {
+                "metrics": [{"expressionType": "SIMPLE", "column": {"column_name": "revenue_usd"},
+                             "aggregate": "SUM", "label": "revenue usd"}],
+                "groupby": [],
+                "x_axis": "genre",
+                "x_axis_sort": "revenue usd",
+                "x_axis_sort_asc": False,
+                "row_limit": 15,
+                "y_axis_format": "SMART_NUMBER",
+            },
+        ),
+        make_chart(
+            "top_games",
+            "Top 10 games by revenue",
+            "echarts_timeseries_bar",
+            "serving.v_game_revenue",
+            {
+                "metrics": [{"expressionType": "SIMPLE", "column": {"column_name": "revenue_usd"},
+                             "aggregate": "SUM", "label": "revenue usd"}],
+                "groupby": [],
+                "x_axis": "title",
+                "x_axis_sort": "revenue usd",
+                "x_axis_sort_asc": False,
+                "orientation": "horizontal",
+                "row_limit": 10,
+                "y_axis_format": "SMART_NUMBER",
+            },
+        ),
     ]
 
     # --------------------------------------------------------------- dashboard
@@ -238,7 +272,7 @@ with app.app_context():
             "meta": {"background": "BACKGROUND_TRANSPARENT"},
         }
 
-    # Grid: 3 rows x 2 chart columns (12-col grid -> width 6 per chart).
+    # Grid: 4 rows x 2 chart columns (12-col grid -> width 6 per chart).
     chart_specs = [
         (charts[0].id, "Events over time (last 24h)"),
         (charts[1].id, "Events by type (last 24h)"),
@@ -246,10 +280,12 @@ with app.app_context():
         (charts[4].id, "Players by country"),
         (charts[2].id, "Revenue by country (all time)"),
         (charts[5].id, "KPI: players / events / revenue"),
+        (charts[6].id, "Revenue by game genre"),
+        (charts[7].id, "Top 10 games by revenue"),
     ]
     node_by_id: dict[str, dict] = {}
     row_ids: list[str] = []
-    for row_idx in range(3):
+    for row_idx in range(len(chart_specs) // 2):
         row_id = f"ROW-{row_idx}"
         chart_ids: list[str] = []
         for col_idx in range(2):

@@ -92,6 +92,13 @@ class RustFSSettings(BaseModel):
     raw_bucket: str = os.getenv("RUSTFS_RAW_BUCKET", "raw-game-events")
 
 
+class GamesApiSettings(BaseModel):
+    """External game-catalog API (FreeToGame): the second, real source."""
+
+    url: str = os.getenv("FREETOGAME_API_URL", "https://www.freetogame.com/api/games")
+    timeout_seconds: float = float(os.getenv("API_TIMEOUT_SECONDS", "20"))
+
+
 class GeneratorSettings(BaseModel):
     events_per_second: float = float(os.getenv("GENERATOR_EVENTS_PER_SECOND", "5"))
     dirty_record_rate: float = float(os.getenv("GENERATOR_DIRTY_RECORD_RATE", "0.05"))
@@ -107,6 +114,7 @@ class Settings(BaseModel):
     spark: SparkSettings = SparkSettings()
     rustfs: RustFSSettings = RustFSSettings()
     generator: GeneratorSettings = GeneratorSettings()
+    games_api: GamesApiSettings = GamesApiSettings()
 
 
 settings = Settings()
