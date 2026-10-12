@@ -361,6 +361,39 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+  # Control panel: one page with a link, health dot and copyable credentials
+  # for every service. The page is rendered from .env at container start, so
+  # no secret is stored in the repo. Bound to localhost only (it shows passwords).
+  portal:
+    image: nginx:1.27-alpine
+    container_name: gaming-portal
+    environment:
+      SUPERSET_ADMIN_USER: ${SUPERSET_ADMIN_USER}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      SOURCE_POSTGRES_USER: ${SOURCE_POSTGRES_USER}
+      SOURCE_POSTGRES_PASSWORD: ${SOURCE_POSTGRES_PASSWORD}
+      SOURCE_POSTGRES_DB: ${SOURCE_POSTGRES_DB}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY}
+      RUSTFS_RAW_BUCKET: ${RUSTFS_RAW_BUCKET}
+    entrypoint: ["sh", "-c", "envsubst '$$SUPERSET_ADMIN_USER $$SUPERSET_ADMIN_PASSWORD $$AIRFLOW_ADMIN_USER $$AIRFLOW_ADMIN_PASSWORD $$CLICKHOUSE_USER $$CLICKHOUSE_PASSWORD $$CLICKHOUSE_DB $$SOURCE_POSTGRES_USER $$SOURCE_POSTGRES_PASSWORD $$SOURCE_POSTGRES_DB $$RUSTFS_ACCESS_KEY $$RUSTFS_SECRET_KEY $$RUSTFS_RAW_BUCKET' < /tpl/index.html.template > /usr/share/nginx/html/index.html && exec nginx -g 'daemon off;'"]
+    ports:
+      - "127.0.0.1:8099:80"
+    volumes:
+      - ./portal/index.html.template:/tpl/index.html.template:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/ >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gaming-net
+
 networks:
   gaming-net:
     driver: bridge

@@ -90,6 +90,7 @@ make register-connector
 make seed-superset
 ```
 
+- **Control panel: http://localhost:8099** (`make portal`) — one page with every service link, a health dot and copyable credentials (generated from `.env`, bound to localhost only)
 - Airflow UI: http://localhost:8080 (credentials: `AIRFLOW_ADMIN_USER` / `AIRFLOW_ADMIN_PASSWORD` from `.env`)
 - RustFS console: http://localhost:9001
 - Spark master UI: http://localhost:8081

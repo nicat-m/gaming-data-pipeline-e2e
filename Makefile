@@ -5,16 +5,20 @@ RATE ?= 5
 BATCH_SIZE ?= 200
 
 .DEFAULT_GOAL := help
-.PHONY: help up down clean ps logs register-connector generate generate-forever consume test
+.PHONY: help portal up down clean ps logs register-connector generate generate-forever consume test
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+
+portal: ## Open the control panel (all service URLs + copyable credentials)
+	@open http://localhost:8099 2>/dev/null || xdg-open http://localhost:8099 2>/dev/null || echo "open http://localhost:8099"
 
 up: ## Start the full infrastructure in the background (incl. first-boot setup)
 	$(COMPOSE) up -d
 	@echo ">> waiting for the stack to become healthy..."
 	@$(COMPOSE) up -d airflow-init superset-init 2>/dev/null || true
 	@$(COMPOSE) ps
+	@echo ">> control panel (all URLs + copyable credentials): http://localhost:8099"
 	@echo ">> next: make smoke  (or the manual steps in README)"
 	@echo ">> if this is the FIRST boot: make register-connector && make seed-superset"
 
