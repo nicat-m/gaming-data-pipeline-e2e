@@ -74,7 +74,7 @@ flowchart LR
     end
     subgraph Storage
         RUSTFS[(RustFS\nraw landing zone\nS3-compatible)]
-        PGRAW[(Postgres warehouse\nschema: raw)]
+        PGRAW[(ClickHouse warehouse\ndatabase: raw)]
     end
     subgraph Transformation
         STG[dbt staging models]
@@ -85,7 +85,7 @@ flowchart LR
         AF[Airflow DAG\ngaming_pipeline]
     end
     subgraph Serving
-        VIEWS[Postgres SQL views\n/ optional BI tool]
+        VIEWS[ClickHouse serving view\n+ Superset dashboard]
     end
 
     GEN -->|INSERT| PGSRC
@@ -129,7 +129,7 @@ flowchart LR
 - **RustFS** — S3-compatible object storage acting as the raw landing
   zone / data lake layer, so raw data is durable and queryable by any
   S3-aware tool before it ever touches the warehouse.
-- **Postgres warehouse, `raw` schema** — the warehouse-side copy of the
+- **ClickHouse warehouse, `raw` database** — the warehouse-side copy of the
   same raw data, loaded by an Airflow task (`load_raw_to_clickhouse`) so
   SQL-based transformation (dbt) can operate on it.
 - **dbt staging models** — 1:1 cleaned/typed views on top of `raw` (dedup,
@@ -169,7 +169,7 @@ flowchart LR
 | Orchestration | Apache Airflow 2.10.2 | DAG-based scheduling, task-level retries, clear dependency graph between load/staging/curated/spark steps | Cron + shell scripts (no dependency graph, no UI, no built-in retry semantics) |
 | Data quality | dbt built-in tests (`not_null`, `unique`, `relationships`, `accepted_values`) | Declared alongside the models they test, runs as part of `dbt test`, no extra service | Great Expectations (a second DQ framework — not justified given dbt tests already cover the required checks) |
 | Containerization | Docker Compose | Single-command, reproducible local infra for every service above | Manual per-service install (not reproducible, fails the Phase 0 "single command" requirement) |
-| Serving | Postgres SQL views on the curated schema | No additional service required; any SQL client or BI tool can consume it | Superset/Metabase as a mandatory component (kept optional) |
+| Serving | ClickHouse SQL view on the curated database + Superset dashboard | Provisioned from the repo; any SQL client or BI tool can also consume the view (ADR 0002) | Metabase/Grafana |
 
 > **Note on the "one new tool" rule:** this stack introduces technologies
 > that may fall outside the course syllabus — **RustFS**, and depending on
@@ -192,9 +192,9 @@ Source schema → raw → staging → curated, following the reduced
 |---|---|---|---|---|---|
 | Source | Postgres `source.game_events` (OLTP table) | Rows inserted directly by the generator | 1 row = 1 event | `event_id` (primary key) | N/A (append-only table, source of truth) |
 | CDC stream | Kafka topic `gaming.source.game_events` | Debezium-published change events, one per insert on `source.game_events` | 1 message = 1 event | `event_id` | N/A (append-only stream, replayable via consumer offsets) |
-| Raw | RustFS `raw/game_events/dt=.../*.jsonl`, then Postgres `raw.game_events` | Untouched copy of every consumed event, including dirty/drifted ones | 1 row = 1 event | `event_id` | Append-only; offset range in the object key makes re-loads idempotent (`ON CONFLICT (event_id) DO NOTHING` on load) |
-| Staging | Postgres `staging` schema | 1:1 cleaned/typed views per raw entity (`stg_game_events`, later split into `stg_players`, `stg_sessions`, `stg_transactions`) | Same grain as raw | `event_id` | Views, recomputed on every `dbt run`; dirty records are flagged, not silently dropped |
-| Curated | Postgres `curated` schema | Dimensional model | See below | See below | Incremental load by `event_time` watermark |
+| Raw | RustFS `raw/game_events/dt=.../*.jsonl`, then ClickHouse `raw.game_events` | Untouched copy of every consumed event, including dirty/drifted ones | 1 row = 1 event | `event_id` | Append-only; offset range in the object key makes re-loads idempotent (ReplacingMergeTree on `(source_partition_date, event_id)`; staging reads with `FINAL`) |
+| Staging | ClickHouse `staging` database | 1:1 cleaned/typed views per raw entity (`stg_game_events`, later split into `stg_players`, `stg_sessions`, `stg_transactions`) | Same grain as raw | `event_id` | Views, recomputed on every `dbt run`; dirty records are flagged, not silently dropped |
+| Curated | ClickHouse `curated` database | Dimensional model | See below | See below | Incremental load by `event_time` watermark |
 
 Curated entities (planned, built out in Phase 2 per the roadmap below):
 
@@ -241,8 +241,8 @@ Curated entities (planned, built out in Phase 2 per the roadmap below):
 - **Idempotency / re-run strategy:** RustFS object keys embed the Kafka
   offset range consumed into that file, so re-running the consumer for the
   same offsets overwrites the same object rather than duplicating it.
-  Postgres raw/source loads use `event_id` as a natural dedup key
-  (`ON CONFLICT DO NOTHING`). dbt models are pure `SELECT`s recomputed from
+  ClickHouse raw loads use `event_id` as a natural dedup key
+  (ReplacingMergeTree + `FINAL` at read time). dbt models are pure `SELECT`s recomputed from
   `raw`/`staging`, so re-running `dbt run` is naturally idempotent. The
   Spark job is scoped to reprocess one `--date` partition at a time, so
   re-running it for the same date is a full overwrite of that partition,
@@ -349,8 +349,8 @@ docker compose -f infra/docker-compose.yml --env-file .env down -v
 - **2026-10-09 — Phase 1 (walking skeleton):** the batch slice
   (Kafka → RustFS → raw → staging → curated → serving) is now implemented
   and orchestrated by Airflow (`gaming_pipeline` DAG): logical-date
-  parameterised, idempotent re-runs (offset-range raw keys + ON CONFLICT
-  upsert + full-refresh tables), 4 dbt DQ checks as a run-failing gate,
+  parameterised, idempotent re-runs (offset-range raw keys + ReplacingMergeTree
+  + full-refresh tables), 4 dbt DQ checks as a run-failing gate,
   serving SQL view + CSV report, deliberate-failure switch
   (`PIPELINE_FAIL_SWITCH`), one-command smoke test (`make smoke`), CI
   (ruff + compile + compose validation). Spark's real S3A batch job is
@@ -368,3 +368,11 @@ docker compose -f infra/docker-compose.yml --env-file .env down -v
   4.1.1** joins the stack as the analytic dashboard (boot-time clickhouse-connect
   install, admin from env, charts auto-refresh for near-live event monitoring) —
   http://localhost:8088. Full Azerbaijani walkthrough: docs/az/LAYIHE_IZAHLARI.md.
+
+- **2026-10-12 — Warehouse change + Phase 1 compliance pass:** the warehouse
+  moved from PostgreSQL to ClickHouse (dbt-clickhouse) and Superset was
+  added as the consumer — see ADR `docs/decisions/0002-clickhouse-warehouse-and-superset.md`.
+  `.env.example` now ships working local-dev values (a fresh clone runs with
+  `cp .env.example .env`), README/evidence were corrected to match the
+  ClickHouse implementation (idempotency via ReplacingMergeTree + FINAL,
+  not ON CONFLICT), and the unused warehouse-Postgres init script was removed.

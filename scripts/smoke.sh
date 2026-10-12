@@ -30,18 +30,25 @@ set -a && . ./.env && set +a
 bash infra/kafka-connect/register-connector.sh
 
 echo "== 4/5 trigger DAG run for ${DS} and poll (timeout 10 min) =="
-docker exec gaming-airflow-scheduler airflow dags unpause gaming_pipeline
-# Idempotent: drop a previous run for the same logical date, then trigger fresh.
-docker exec gaming-airflow-postgres psql -U airflow -d airflow \
-  -c "DELETE FROM task_instance WHERE dag_id='gaming_pipeline'" \
-  -c "DELETE FROM dag_run WHERE dag_id='gaming_pipeline'" > /dev/null
-docker exec gaming-airflow-scheduler airflow dags trigger gaming_pipeline -e "${EXEC_DATE}" > /dev/null
-echo "   triggered for ${DS}"
+AF="$COMPOSE exec -T airflow-scheduler"
+$AF airflow dags unpause gaming_pipeline
+# Idempotent: if a run for this logical date already exists, clear it (a
+# normal Airflow re-run); otherwise trigger a new one. Other dates' runs and
+# history are left untouched.
+EXISTING="$($AF airflow dags state gaming_pipeline "${EXEC_DATE}" 2>/dev/null | tail -1 | tr -d '[:space:]')"
+# `dags state` exits 0 and prints "None" when no run exists for the date.
+if [ -n "${EXISTING}" ] && [ "${EXISTING}" != "None" ]; then
+  $AF airflow tasks clear gaming_pipeline -s "${EXEC_DATE}" -e "${EXEC_DATE}" -y >/dev/null 2>&1
+  echo "   existing run for ${DS} cleared and re-queued"
+else
+  $AF airflow dags trigger gaming_pipeline -e "${EXEC_DATE}" >/dev/null
+  echo "   triggered for ${DS}"
+fi
 
 STATE="queued"
 for _ in $(seq 1 60); do
   sleep 10
-  STATE="$(docker exec gaming-airflow-scheduler airflow dags state gaming_pipeline "${EXEC_DATE}" 2>/dev/null | tail -1 | awk '{print $NF}')"
+  STATE="$($AF airflow dags state gaming_pipeline "${EXEC_DATE}" 2>/dev/null | tail -1 | awk '{print $NF}')"
   echo "   run state: ${STATE:-<none>}"
   case "${STATE:-}" in
     success) break ;;

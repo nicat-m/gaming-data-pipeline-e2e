@@ -1,7 +1,7 @@
 # Gaming Lakehouse Pipeline — Layihə İzahları
 
 > Bu sənəd layihəni **biznes** və **texniki** tərəfdən tam izah edir.
-> Dil: Azərbaycan · Yeniləndi: 2026-10-09 (Phase 2: ClickHouse anbarı + Superset dashboard)
+> Dil: Azərbaycan · Yeniləndi: 2026-10-12 (Phase 1 uyğunluq düzəlişləri: raw delete-then-insert, işləyən `.env.example`)
 
 ---
 
@@ -138,8 +138,9 @@ ORDER BY (source_partition_date, event_id)
 ```
 
 - **ReplacingMergeTree**: eyni ORDER BY açarı ilə (`source_partition_date`, `event_id`)
-  təkrar insert olunsa, merge zamanı təkrarlar bir sətrə yığılır → **yenidən işə
-  salma idempotentdir** (eyni günü 2 dəfə yükləsən, dublikat yaranmır).
+  təkrar insert olunsa, merge zamanı təkrarlar bir sətrə yığılır. Merge asinxron
+  olduğuna görə **əsas** idempotency mexanizmi DAG-dakı delete-then-insert-dir
+  (bax 3.3); ReplacingMergeTree + staging-də `FINAL` ehtiyat qatıdır.
 - Raw lay "dumb" (elə-gəldiyi-kimi) saxlanılır: `player_signup_date` Debezium-un
   göndərdiyi epoch-days int kimi **string** olaraq qalır, `source_partition_date`
   string dt açarıdır. Tipləşdirmə staging-də olur.
@@ -149,8 +150,8 @@ ORDER BY (source_partition_date, event_id)
 | Qat | Mexanizm |
 |---|---|
 | RustFS raw obyektlər | Fayl adında Kafka **offset aralığı**: `raw/game_events/dt=2026-10-09/0-199.jsonl`. Yenidən oxuyanda eyni açar üstə yazır. |
-| ClickHouse raw | `ReplacingMergeTree` — eyni `event_id` təkrarı merge-də yığılır. |
-| Staging | Materalized **view** — həmişə raw-dan hesablanır, dublikat ola bilməz. |
+| ClickHouse raw | **Delete-then-insert**: yükləmədən əvvəl yalnız həmin `source_partition_date` partisiyası silinir (digər günlərə toxunulmur), sonra yazılır. Üstəlik run daxilində `event_id` üzrə dedup edilir (üst-üstə düşən offset aralıqları eyni event-i iki fayla sala bilər). `ReplacingMergeTree` əlavə təhlükəsizlik toru kimi qalır. Nəticə: hər run-dan sonra raw-da sətir sayı = unikal event sayı. |
+| Staging | **View** (`FINAL` ilə) — həmişə raw-dan hesablanır, dublikat görünə bilməz. |
 | Curated | dbt **table** materializasiyası — hər run-da tam yenidən qurulur (`CREATE OR REPLACE`). |
 | Serving | `CREATE OR REPLACE VIEW` + deterministik CSV açarı (`dt=<gün>/report.csv`). |
 
@@ -173,8 +174,14 @@ keçməsə, downstream tasklar skip olunur və run `failed` işarələnir. Mövc
 1. `not_null(stg_game_events.event_id)` — PK boş ola bilməz
 2. `unique(stg_game_events.event_id)` — dedup doğruluğu
 3. `accepted_values(event_type ∈ {session_start, session_end, in_game_transaction})`
-4. `assert_staging_has_rows` (singular test) — boş raw üzərində run yayımlamaqsız dayanır
-5. `not_null/unique` curated modellərdə (dim_player.player_id, fct.event_id)
+4. `assert_staging_has_rows` (singular test) — boş raw üzərində run yayımlanmır
+
+Bunlardan biri uğursuz olsa run **failed** olur. Qeyd: `schema.yml`-də curated
+modellər üçün də `not_null/unique` testləri təyin olunub (`dim_player.player_id`,
+`fct.event_id`), amma DAG hazırda yalnız `dbt test --select staging` işlədir —
+curated testlər əl ilə (`dbt test --select curated`) işlədilir. TODO.
+
+---
 
 ### 3.6 Logical-date parametrasiyası
 
@@ -208,17 +215,34 @@ Phase 3-dür (RustFS-dən oxuyub `agg_player_daily_engagement` yazır); Phase 1-
 
 ### 3.9 Təhlükəsizlik və gizli məlumatlar
 
-- Heç bir secret repoda yoxdur: `.env` gitignore-dadır, `.env.example` yer tutucularla.
+- Heç bir real secret repoda yoxdur: `.env` gitignore-dadır. `.env.example` yalnız **lokal dev** üçün nümunə dəyərlər saxlayır (dəyişmədən işləyir); paylaşılan mühitdə mütləq dəyişdirilməlidir.
 - dbt profili `env_var()` ilə işləyir — repoya kommit oluna bilər.
 - Airflow container-ların docker socket-i **read-only** mount-dur (yalnız Spark proof).
-- Parollar `.env`-də generasiya təlimatları ilə (`openssl rand`, `secrets` modulu).
+- Bütün qoşulma məlumatları (host, port, bucket, parol) mərkəzi `config/settings.py` vasitəsilə `.env`-dən oxunur; kodda sabit dəyər yoxdur.
 
 ### 3.10 CI (GitHub Actions)
 
 `.github/workflows/ci.yml`: hər PR/main push-da:
 1. `ruff check .` — lint
 2. `python -m compileall` — bütün modullar kompilyasiya olunur
-3. `docker compose config --quiet` — infrastruktur tərifi etibarlıdır
+3. `docker compose config --quiet` (`.env.example` ilə) — infrastruktur tərifi etibarlıdır
+4. `pytest` — vahid testlər (generator, dbt layihə strukturu)
+
+---
+
+### 3.11 Data modeli
+
+| Qat | Obyekt | Dənə (1 sətir =) | Əsas sütunlar |
+|---|---|---|---|
+| Source | `source.game_events` (Postgres) | 1 event | `event_id` (PK), `event_type`, tarix, oyunçu/cihaz/oyun sahələri |
+| Raw | `raw.game_events` | 1 event | mənbə sütunları + `source_partition_date`, `loaded_at` |
+| Staging | `staging.stg_game_events` (view) | 1 event | tipləşdirilmiş `event_time` (pozuqsa NULL), `player_signup_date` (Date) |
+| Curated | `curated.dim_player` | 1 oyunçu | `player_id`, `display_name`, `country`, `signup_date` (SCD1: son dəyər qalib) |
+| Curated | `curated.fct_in_game_transaction` | 1 alış-veriş | `event_id`, `player_id`, `session_id`, `amount_usd`, `currency`, `event_time` |
+| Serving | `serving.v_player_engagement_daily` (view) | oyunçu × ölkə | `transactions`, `total_amount_usd`, `last_txn_at` |
+
+Phase 1-də naiv qərarlar (sənədləşdirilmiş TODO): mənfi məbləğlər fact-da saxlanır,
+`dim_player` SCD2 deyil.
 
 ---
 
@@ -239,24 +263,21 @@ Müqayisə (anbar analitika dashboard-ları üçün):
 yete r: son N dəqiqənin event sayı, ölkə bazasında aktivlik, transaksiya həcmi
 canlı yenilənir (mənbə: ClickHouse-dan birbaşa sorğu — sürətli, saniyələşdirilmiş gecikmə).
 
-### 4.2 Quraşdırma (bir dəfə)
+### 4.2 Quraşdırma (repodan təkrarlana bilən)
 
-1. Stack qalxanda Superset avtomatik başlayır: `http://localhost:8088`
+Əl ilə "klik-klik" qurulmur — hamısı koddadır:
+
+1. `make up` — `superset-init` konteyneri migrasiyanı edir, admin istifadəçi yaradır
    (login: `.env`-də `SUPERSET_ADMIN_USER` / `SUPERSET_ADMIN_PASSWORD`).
-2. Sol menyu → **Database Connections** → **+ Database** → **ClickHouse (connect)**:
-   - Host: `clickhouse`, Port: `8123`, Username: `CLICKHOUSE_USER` (.env-dən),
-     Password: `CLICKHOUSE_PASSWORD`, Database: `CLICKHOUSE_DB` (gaming_lakehouse)
-3. **Datasets** → `curated.dim_player`, `curated.fct_in_game_transaction`,
-   `serving.v_player_engagement_daily`, `staging.stg_game_events` əlavə edin.
-4. Dashboard yarat: "Gaming Overview" → chartlar:
+2. `make seed-superset` — [scripts/superset_seed.py](../../scripts/superset_seed.py)
+   ClickHouse bağlantısını, dataset-ləri, 6 chart-ı və
+   "Gaming Lakehouse — Live Overview" dashboard-unu yaradır (idempotent).
+3. Aç: `http://localhost:8088`.
 
-| Chart | Növ | Sorğu (qısa) |
-|---|---|---|
-| Saatlıq event axını (canlı, 10s refresh) | Line / Bar | `SELECT toStartOfHour(event_time) h, count(*) FROM staging.stg_game_events WHERE event_time > now() - INTERVAL 6 HOUR GROUP BY h` |
-| Ölkə üzrə aktiv oyunçu | Bar | `staging` üzərindən `uniq(player_id)` by `player_country` |
-| Gəlir (USD) oyun üzrə | Bar | `fct_in_game_transaction` by `game_id` (staging-dən join) |
-| Top xərcləyən oyunçular | Table | `serving.v_player_engagement_daily` ORDER BY `total_amount_usd DESC` |
-| Churn siqnalı (sessiya başa vurmayanlar) | Big Number | `session_end` sayı / `session_start` sayı |
+Seed edilən chart-lar (nümunə): "Events over time (last 24h)", "Events by type
+(last 24h)", "Revenue by country (all time)", "Transactions per hour (last 7 days)"
+və s. Mənbələr: `staging.stg_game_events`, `curated.fct_in_game_transaction`,
+`serving.v_player_engagement_daily`.
 
 ### 4.3 "Anlıq" necə işləyir (dürüst gecikmə hesabatı)
 
@@ -268,37 +289,89 @@ ilə gələcək.
 
 ---
 
-## 5. NECƏ İŞƏ SALINIR (əmrlər xülasəsi)
+## 5. SIFIRDAN NECƏ İŞƏ SALMAQ (addım-addım)
+
+### 5.1 Tələblər
+
+- Docker + Docker Compose v2, ~8 GB boş RAM
+- Python 3.11+ (generator, smoke test və testlər host-da `.venv` ilə işləyir)
+- `make`, `curl`, `envsubst` (macOS: `brew install gettext`)
+
+### 5.2 Quraşdırma
 
 ```bash
-cp .env.example .env            # dəyərləri doldur (Fernet, secret key, parollar)
-make up                         # stack qalxır (ilk dəfə Airflow image build olunur ~3-5 dəq)
-make register-connector         # Debezium CDC (idempotent — hər up-dan sonra təhlükəsizdir)
-make seed-superset              # dashboard/chart-ları yaradır (idempotent — yalnız 1 dəfə, ya da layout dəyişəndə)
-make generate COUNT=5000 RATE=1000   # source-a 5000 event yaz
-make rerun                      # DAG-ı bugün üçün trigger et (və ya Airflow UI-dən)
-make smoke                      # uc-u-cərvə smoke test + qat yoxlaması
+git clone <repo-url> && cd gaming-data-pipeline-e2e
+cp .env.example .env                       # redaktə lazım deyil (lokal dev dəyərləri)
+
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt            # make generate / make smoke bunu istifadə edir
+
+make up                                    # stack qalxır (ilk dəfə Airflow image build ~3-5 dəq)
+make ps                                    # hamısı "healthy" olana qədər gözlə
+make register-connector                    # Debezium CDC (idempotent)
+make seed-superset                         # dashboard (idempotent)
 ```
 
-> **`make clean` + `make up` sonrası qayda:** clean bütün volumeları sildiyi üçün
-> **hər şey sıfırdan** başlayır — data, connector qeydiyyatı, Superset dashboard,
-> Airflow admin user. `make up` bu yarpaqların bir çoxunu avtomatik edir (init
-> konteynerləri admin/migration işlərini görür), amma 2 manual addım həmişə lazımdır:
-> `make register-connector` və `make seed-superset` (hər ikisi idempotentdir —
-> təkrar işə salmaq təhlükəsizdir). Data üçün `make smoke` (və ya `generate` +
-> `rerun`) yenidən event yaratmalı olacaq, çünki clean köhnə datanı silib.
+### 5.3 Pipeline-ı işə salmaq
+
+```bash
+make smoke                                 # hər şeyi edir: event yaradır, DAG-ı trigger edir, hər qatı yoxlayır
+SMOKE_DS=2026-10-11 make smoke             # konkret logical date üçün
+```
+
+Və ya addım-addım:
+
+```bash
+make generate COUNT=5000 RATE=1000         # source-a event yaz
+make rerun                                 # DAG-ı bugün üçün trigger/re-run et (və ya Airflow UI)
+```
+
+Gözlənilən nəticə: Airflow-da `gaming_pipeline` run-u `success`, smoke sonunda
+"reconciliation OK" və "smoke PASSED". Hər qat üçün say cədvəli çıxır.
+
+### 5.4 Yoxlama
+
+```bash
+docker exec gaming-clickhouse clickhouse-client --query "
+  SELECT 'raw', count(*) FROM gaming_lakehouse.raw.game_events
+  UNION ALL SELECT 'staging', count(*) FROM gaming_lakehouse.staging.stg_game_events
+  UNION ALL SELECT 'fct', count(*) FROM gaming_lakehouse.curated.fct_in_game_transaction
+  UNION ALL SELECT 'serving', count(*) FROM gaming_lakehouse.serving.v_player_engagement_daily"
+```
+
+Loglar: Airflow UI → `gaming_pipeline` → task → Logs, və ya
+`docker logs gaming-airflow-scheduler`. Hər task start/end, input/output və sətir
+sayını yazır.
+
+### 5.5 Qəsdən xəta demosu
+
+```bash
+# .env-də PIPELINE_FAIL_SWITCH=1 et, sonra:
+make up                                    # Airflow konteynerləri yenidən yaranır
+make rerun                                 # land_raw_kafka_to_rustfs fail, qalan tasklar skip, run = failed
+# geri: PIPELINE_FAIL_SWITCH=0 + make up
+```
+
+### 5.6 Dayandırma / restart / sıfırlama
+
+```bash
+make down      # dayandır, data qalır (named volumes)
+make up        # yenidən qaldır — əvvəlki nəticələr yerindədir, pipeline yenidən işləyir
+make clean     # TAM sıfırlama: bütün volume-lar silinir
+```
+
+> **`make clean` + `make up` sonrası:** hər şey sıfırdan başlayır (data, connector
+> qeydiyyatı, Superset dashboard). Yenidən `make register-connector`,
+> `make seed-superset` və `make smoke` (yeni event yaradır) lazımdır.
 
 Brauzerlər: Airflow `8080` · Superset `8088` · Kafka UI `8085` · Spark UI `8081` ·
 RustFS konsol `9001` · ClickHouse HTTP `8123`.
 
-Yoxlama (anbar qatları):
+### 5.7 Tez-tez rast gəlinən problemlər
 
-```bash
-docker exec -it gaming-clickhouse clickhouse-client \
-  --query "SELECT 'raw', count(*) FROM gaming_lakehouse.raw.game_events
-           UNION ALL SELECT 'staging', count(*) FROM gaming_lakehouse.staging.stg_game_events
-           UNION ALL SELECT 'fct', count(*) FROM gaming_lakehouse.curated.fct_in_game_transaction"
-```
+- `make generate` / `make smoke` "`.venv/bin/python` yoxdur" deyirsə — 5.2-dəki venv + pip addımı atlanıb.
+- Run `None` vəziyyətində qalırsa — DAG paused ola bilər (`make smoke` onu avtomatik unpause edir).
+- Smoke "raw < 1000" deyirsə — connector qeydiyyatdan keçməyib (`make register-connector`) və ya Kafka-ya event çatmayıb.
 
 ---
 

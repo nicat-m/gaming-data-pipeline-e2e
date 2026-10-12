@@ -8,7 +8,7 @@ student during the live run (they cannot be produced from CI).
 > **[SCREENSHOT 1 — Airflow UI, Graph view of `gaming_pipeline`, all tasks
 > green (success) for a manual run triggered for a specific logical date.]**
 
-Reproduce: `make smoke` (uses `SMOKE_DS=${date -u +%F}`), or trigger
+Reproduce: `make smoke` (logical date defaults to today, UTC), or trigger
 manually for a specific date:
 
 ```bash
@@ -33,30 +33,47 @@ PIPELINE_FAIL_SWITCH=0 make up
 
 ## 3. Row counts per layer (from the smoke test)
 
-Replace the numbers below with the output of the last smoke run:
+Output of `SMOKE_DS=2026-10-11 SMOKE_COUNT=1000 make smoke` — the **third**
+run for that logical date, after a run for 2026-10-12 had also been loaded:
 
 ```text
-layer                     | rows
---------------------------+-----------
-raw.game_events (ds=...)  | <FILL>
-raw.game_events (total)   | <FILL>
-staging.stg_game_events   | <FILL>
-  flagged dirty (NULL ts) | <FILL>
-curated.fct_transactions  | <FILL>
-curated.dim_player        | <FILL>
-serving view rows         | <FILL>
-serving CSV report        | exists=True
+layer                            | rows
+---------------------------------+-----------
+raw.game_events (ds=2026-10-11)  | 7000
+  distinct event_id (ds)         | 7000
+raw.game_events (total)          | 12000
+  distinct event_id (total)      | 12000
+staging.stg_game_events(ds)      | 7000
+staging.stg_game_events          | 12000
+  flagged dirty (NULL ts)        | 193
+curated.fct_transactions         | 3860
+curated.dim_player               | 11799
+serving view rows                | 3801
+serving CSV report               | serving/player_engagement_daily/dt=2026-10-11/report.csv exists=True
+raw rows per logical date        | 2026-10-11: 7000 (7000)   2026-10-12: 5000 (5000)
 ```
 
-Reconciliation rule (asserted by `scripts/smoke_verify.py`):
+(Counts grow between runs only because each `make smoke` first seeds new
+synthetic events into the source; the point is that rows == distinct events
+for every date, i.e. no duplicates after repeated runs, and that both logical
+dates coexist.)
 
-- `staging == raw total` — staging is a 1:1 typed view over raw.
+Reconciliation rules (asserted by `scripts/smoke_verify.py`):
+
+- `raw rows == raw distinct event_id` per date — the raw load is
+  delete-then-insert for the logical date plus in-run dedup on `event_id`.
+- `staging == raw distinct` — staging is a 1:1 typed view over raw
+  (`FINAL` on the ReplacingMergeTree as a safety net).
 - `fct == staging rows where event_type='in_game_transaction' and event_time IS NOT NULL`
   — the difference vs. staging is explained: session rows and rows whose
   malformed timestamps were flagged to NULL (dirty-record policy).
-- Re-running the same logical date adds no rows (idempotency:
-  offset-range object keys + `ON CONFLICT (event_id) DO NOTHING` +
-  full-refresh table models).
+- Raw ≥ 1000 rows for the logical date.
+
+Re-running the same logical date is safe: raw objects are keyed by Kafka
+offset range, the raw load clears and reloads only that date's partition,
+curated models are full-refresh and serving is `CREATE OR REPLACE VIEW`.
+`make smoke` re-runs an existing date with `airflow tasks clear` instead of
+deleting run history.
 
 ## 4. Restart persistence
 

@@ -16,7 +16,9 @@ serving.v_player_engagement_daily).
 """
 from __future__ import annotations
 
+import os
 import sys
+from urllib.parse import quote_plus
 
 from superset.app import create_app
 
@@ -25,13 +27,26 @@ app = create_app()
 with app.app_context():
     from flask_appbuilder.security.sqla.models import User  # noqa: F401
     from superset import db
+    from superset.connectors.sqla.models import SqlaTable
     from superset.models.core import Database
     from superset.models.dashboard import Dashboard
     from superset.models.slice import Slice
-    from superset.connectors.sqla.models import SqlaTable
 
     admin = db.session.query(User).filter_by(username="admin").first()
-    ch_db = db.session.query(Database).filter_by(database_name="Gaming Lakehouse (ClickHouse)").one()
+    # ClickHouse connection, built from the same env vars as the rest of the stack.
+    conn_name = "Gaming Lakehouse (ClickHouse)"
+    ch_db = db.session.query(Database).filter_by(database_name=conn_name).first()
+    if ch_db is None:
+        ch_db = Database(database_name=conn_name)
+        db.session.add(ch_db)
+    ch_db.set_sqlalchemy_uri(
+        "clickhousedb://{u}:{p}@clickhouse:8123/{d}".format(
+            u=quote_plus(os.environ["CLICKHOUSE_USER"]),
+            p=quote_plus(os.environ["CLICKHOUSE_PASSWORD"]),
+            d=os.environ["CLICKHOUSE_DB"],
+        )
+    )
+    db.session.commit()
 
     # ---------------------------------------------------------------- datasets
     wanted_datasets = [
@@ -90,9 +105,19 @@ with app.app_context():
             db.session.flush()
             print(f"chart created:  {name}")
         else:
+            chart.viz_type = viz
             chart.params = _json.dumps(params)
             print(f"chart exists:   {name}")
         return chart
+
+    def _last(col: str, unit: str, n: int) -> list[dict]:
+        # Superset 4.x time filtering = a TEMPORAL_RANGE adhoc filter on the time
+        # column. A rolling window anchored on "now": the "Last day"/"Last week"
+        # presets are calendar-based (end at midnight today) and would hide
+        # today's events.
+        window = f'DATEADD(DATETIME("now"), -{n}, {unit}) : DATETIME("now")'
+        return [{"expressionType": "SIMPLE", "clause": "WHERE", "subject": col,
+                 "operator": "TEMPORAL_RANGE", "comparator": window}]
 
     charts = [
         make_chart(
@@ -106,8 +131,7 @@ with app.app_context():
                 "groupby": [],
                 "x_axis": "event_time",
                 "time_grain_sqla": "PT1H",
-                "time_range": "Last 24 hours",
-                "adhoc_filters": [],
+                "adhoc_filters": _last("event_time", "hour", 24),
                 "y_axis_format": "SMART_NUMBER",
                 "rich_tooltip": True,
                 "show_legend": False,
@@ -119,10 +143,10 @@ with app.app_context():
             "pie",
             "staging.stg_game_events",
             {
-                "metrics": [{"expressionType": "SIMPLE", "column": {"column_name": "event_id"},
-                             "aggregate": "COUNT", "label": "events"}],
+                "metric": {"expressionType": "SIMPLE", "column": {"column_name": "event_id"},
+                           "aggregate": "COUNT", "label": "events"},
                 "groupby": ["event_type"],
-                "time_range": "Last 24 hours",
+                "adhoc_filters": _last("event_time", "hour", 24),
                 "row_limit": 10,
                 "donut": True,
                 "labels_outside": True,
@@ -131,15 +155,16 @@ with app.app_context():
         make_chart(
             "revenue_by_country",
             "Revenue by country (all time)",
-            "echarts_bar_horizontal",
+            "echarts_timeseries_bar",
             "serving.v_player_engagement_daily",
             {
                 "metrics": [{"expressionType": "SIMPLE", "column": {"column_name": "total_amount_usd"},
                              "aggregate": "SUM", "label": "revenue usd"}],
-                "groupby": ["country"],
+                "groupby": [],
+                "x_axis": "country",
+                "orientation": "horizontal",
                 "row_limit": 15,
                 "y_axis_format": "SMART_NUMBER",
-                "sort_by_metric": True,
             },
         ),
         make_chart(
@@ -152,7 +177,7 @@ with app.app_context():
                              "aggregate": "COUNT", "label": "transactions"}],
                 "x_axis": "event_time",
                 "time_grain_sqla": "PT1H",
-                "time_range": "Last 7 days",
+                "adhoc_filters": _last("event_time", "day", 7),
                 "y_axis_format": "SMART_NUMBER",
             },
         ),
@@ -162,8 +187,8 @@ with app.app_context():
             "pie",
             "curated.dim_player",
             {
-                "metrics": [{"expressionType": "SIMPLE", "column": {"column_name": "player_id"},
-                             "aggregate": "COUNT", "label": "players"}],
+                "metric": {"expressionType": "SIMPLE", "column": {"column_name": "player_id"},
+                           "aggregate": "COUNT", "label": "players"},
                 "groupby": ["country"],
                 "row_limit": 15,
                 "donut": True,
@@ -172,7 +197,7 @@ with app.app_context():
         make_chart(
             "kpi_numbers",
             "KPI: players / events / revenue",
-            "big_number",
+            "big_number_total",
             "serving.v_player_engagement_daily",
             {
                 "metric": {"expressionType": "SIMPLE", "column": {"column_name": "total_amount_usd"},
@@ -232,21 +257,21 @@ with app.app_context():
             chart_id, slice_name = chart_specs[row_idx * 2 + col_idx]
             node_by_id[node_id] = _chart_node(
                 chart_id, node_id, slice_name,
-                ["ROOT_ID", "GRID-0", row_id],
+                ["ROOT_ID", "GRID_ID", row_id],
             )
             chart_ids.append(node_id)
-        node_by_id[row_id] = _row_node(row_id, chart_ids, ["ROOT_ID", "GRID-0"])
+        node_by_id[row_id] = _row_node(row_id, chart_ids, ["ROOT_ID", "GRID_ID"])
         row_ids.append(row_id)
 
-    node_by_id["GRID-0"] = {
+    node_by_id["GRID_ID"] = {
         "type": "GRID",
-        "id": "GRID-0",
+        "id": "GRID_ID",
         "children": row_ids,
         "parents": ["ROOT_ID"],
     }
     position_json = {
         "DASHBOARD_VERSION_KEY": "v2",
-        "ROOT_ID": {"type": "ROOT_ID", "id": "ROOT_ID", "children": ["GRID-0"]},
+        "ROOT_ID": {"type": "ROOT", "id": "ROOT_ID", "children": ["GRID_ID"]},
         **node_by_id,
     }
     if dash is None:

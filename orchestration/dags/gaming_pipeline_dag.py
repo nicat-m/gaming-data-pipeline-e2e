@@ -146,10 +146,11 @@ def load_raw_to_clickhouse(partition_date: str, **_context) -> int:
     """Raw-load task: land every NDJSON object for the logical date in the
     ClickHouse raw database.
 
-    Idempotency: ReplacingMergeTree + the same (source_partition_date,
-    event_id) ORDER BY key make re-runs converge to one row per event - a
-    re-run's insert collapses on the next merge (or is deduped at read time
-    with FINAL / argMax in the curated models).
+    Idempotency: delete-then-insert for the logical date's partition (other
+    dates are untouched) plus in-run dedup on event_id (overlapping Kafka
+    offset ranges can land the same event in two objects), so the raw layer
+    holds exactly one row per event per date after every run. ReplacingMergeTree
+    stays as a safety net; staging still reads with FINAL.
     """
     task = "load_raw_to_clickhouse"
     prefix = f"raw/game_events/dt={partition_date}/"
@@ -164,6 +165,14 @@ def load_raw_to_clickhouse(partition_date: str, **_context) -> int:
     client = _get_clickhouse_client()
     client.command(RAW_TABLE_DDL)
     _print(task, "raw.game_events table ready (ReplacingMergeTree)")
+    client.command(
+        "ALTER TABLE raw.game_events DELETE WHERE source_partition_date = %(ds)s "
+        "SETTINGS mutations_sync = 2",
+        parameters={"ds": partition_date},
+    )
+    _print(task, f"partition {partition_date} cleared (delete-then-insert)")
+    seen_event_ids: set[str] = set()
+    duplicates_skipped = 0
 
     for obj in objects:
         body = s3.get_object(Bucket=settings.rustfs.raw_bucket, Key=obj["Key"])
@@ -172,6 +181,11 @@ def load_raw_to_clickhouse(partition_date: str, **_context) -> int:
         batch = []
         for rec in records:
             row = rec.get("after") if isinstance(rec.get("after"), dict) else rec
+            event_key = str(row.get("event_id"))
+            if event_key in seen_event_ids:
+                duplicates_skipped += 1
+                continue
+            seen_event_ids.add(event_key)
             values = [_coerce_raw_value(col, row.get(col)) for col in RAW_COLUMNS]
             batch.append((*values, partition_date))  # raw layer: dt=<date> stays a string
         if batch:
@@ -182,7 +196,7 @@ def load_raw_to_clickhouse(partition_date: str, **_context) -> int:
             )
             rows_inserted += len(batch)
     _print(task, f"end: rows_read={rows_read} rows_inserted={rows_inserted} "
-                 f"(ReplacingMergeTree dedupes re-runs on the same event_id)")
+                 f"duplicates_skipped={duplicates_skipped}")
     return rows_inserted
 
 
@@ -199,7 +213,7 @@ def spark_connectivity_proof(**_context) -> None:
     # HOME must point at a writable dir: the Bitnami Spark image resolves the
     # ivy cache under $HOME/.ivy2 and fails with "basedir must be absolute: ?/.ivy2/local"
     # when HOME is unset/"/" (as it is for a bare exec without the image's entrypoint).
-    result = client.containers.get("gaming-spark-master").exec_run(
+    result = client.containers.get(os.getenv("SPARK_CONTAINER_NAME", "gaming-spark-master")).exec_run(
         cmd=[
             "sh", "-c",
             "export HOME=/opt/bitnami/spark; "
@@ -254,11 +268,9 @@ def publish_serving(partition_date: str, **_context) -> None:
 
 def _get_clickhouse_client():
     # Warehouse client used by the raw loader and the serving publisher.
-    # Inside the compose network the service name is `clickhouse`; the
-    # settings default (localhost) only matters for host-side CLI use.
-    host = settings.clickhouse.host
+    # CLICKHOUSE_HOST is set by docker-compose for the Airflow containers.
     return clickhouse_connect.get_client(
-        host="clickhouse" if host in ("localhost", "127.0.0.1") else host,
+        host=settings.clickhouse.host,
         port=settings.clickhouse.port,
         username=settings.clickhouse.user,
         password=settings.clickhouse.password,

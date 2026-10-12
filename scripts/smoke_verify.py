@@ -1,4 +1,4 @@
-"""Phase 2 smoke-test verifier: row counts per layer + reconciliation.
+"""Phase 1 smoke-test verifier: row counts per layer + reconciliation.
 
 Run via `make smoke` (scripts/smoke.sh) - uses the real services from
 docker compose: the ClickHouse warehouse and RustFS (boto3), reached
@@ -31,8 +31,20 @@ def main() -> int:
     raw_count = client.query(
         f"SELECT count(*) FROM raw.game_events WHERE source_partition_date = '{ds}'"
     ).result_rows[0][0]
+    raw_ds_distinct = client.query(
+        f"SELECT uniq(event_id) FROM raw.game_events WHERE source_partition_date = '{ds}'"
+    ).result_rows[0][0]
     raw_total = client.query("SELECT count(*) FROM raw.game_events").result_rows[0][0]
+    raw_distinct = client.query("SELECT uniq(event_id) FROM raw.game_events").result_rows[0][0]
+    # Every logical date loaded so far: proves different dates coexist.
+    raw_by_date = client.query(
+        "SELECT source_partition_date, count(*), uniq(event_id) FROM raw.game_events "
+        "GROUP BY source_partition_date ORDER BY source_partition_date"
+    ).result_rows
     staging_count = client.query("SELECT count(*) FROM staging.stg_game_events").result_rows[0][0]
+    staging_ds = client.query(
+        f"SELECT count(*) FROM staging.stg_game_events WHERE source_partition_date = '{ds}'"
+    ).result_rows[0][0]
     staging_dirty = client.query(
         "SELECT count(*) FROM staging.stg_game_events WHERE event_time IS NULL"
     ).result_rows[0][0]
@@ -59,27 +71,37 @@ def main() -> int:
     print("layer                        | rows")
     print("-----------------------------+-----------")
     print(f"raw.game_events (ds={ds})  | {raw_count}")
+    print(f"  distinct event_id (ds)    | {raw_ds_distinct}")
     print(f"raw.game_events (total)     | {raw_total}")
+    print(f"  distinct event_id (total) | {raw_distinct}")
+    print(f"staging.stg_game_events(ds) | {staging_ds}")
     print(f"staging.stg_game_events     | {staging_count}")
     print(f"  flagged dirty (NULL ts)   | {staging_dirty}")
     print(f"curated.fct_transactions    | {fct_count}")
     print(f"curated.dim_player          | {dim_count}")
     print(f"serving view rows           | {serving_count}")
     print(f"serving CSV report          | {report_key} exists={report_exists}")
+    print("raw rows per logical date   | date: rows (distinct events)")
+    for d, n, u in raw_by_date:
+        print(f"  {d}                | {n} ({u})")
 
     failures: list[str] = []
     if raw_count < 1000:
         failures.append(f"raw has {raw_count} rows for ds={ds}; Phase 1 requires >= 1000")
-    # Staging is a FINAL view over ReplacingMergeTree: deduped 1:1 with raw's
-    # distinct events (pre-merge duplicates in raw are invisible downstream).
-    if staging_count < raw_count:
-        # raw may hold pre-merge duplicates; staging must be >= its distinct set
-        distinct_raw = client.query("SELECT uniq(event_id) FROM raw.game_events").result_rows[0][0]
-        if staging_count != distinct_raw:
-            failures.append(
-                f"staging ({staging_count}) != raw distinct ({distinct_raw}); "
-                "staging must be a deduped 1:1 view of raw"
-            )
+    # Staging is a FINAL view over ReplacingMergeTree: it must equal raw's
+    # DISTINCT events (pre-merge duplicates in raw are invisible downstream).
+    # Any difference raw_count - raw_ds_distinct is re-run duplication that
+    # ClickHouse has not merged yet - reported above, removed at read time.
+    if raw_count != raw_ds_distinct:
+        failures.append(
+            f"raw has duplicates for ds={ds}: {raw_count} rows vs {raw_ds_distinct} distinct events"
+        )
+    if staging_ds != raw_ds_distinct:
+        failures.append(
+            f"staging ({staging_ds}) != raw distinct events ({raw_ds_distinct}) for ds={ds}"
+        )
+    if staging_count != raw_distinct:
+        failures.append(f"staging total ({staging_count}) != raw distinct total ({raw_distinct})")
     if fct_count != expected_fct:
         failures.append(f"fct ({fct_count}) != expected ({expected_fct})")
     if dim_count == 0:

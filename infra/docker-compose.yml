@@ -37,6 +37,7 @@ x-airflow-common: &airflow-common
     # in .env, `make up` again, trigger the DAG -> land_raw task raises and
     # everything downstream is skipped. Remove it (or set to 0) to run normally.
     PIPELINE_FAIL_SWITCH: ${PIPELINE_FAIL_SWITCH:-0}
+    SPARK_CONTAINER_NAME: ${SPARK_CONTAINER_NAME:-gaming-spark-master}
     PYTHONPATH: /opt/airflow
   volumes:
     - ../orchestration/dags:/opt/airflow/dags
@@ -200,8 +201,7 @@ services:
   # the HTTP interface (8123) and visualises the curated/serving models -
   # including the live event view built on the Kafka push channel.
   # Credentials come from .env (SUPERSET_* variables); the ClickHouse
-  # database connection is created once via the UI (documented in
-  # docs/az/TEXNIKI_IZAHLAR.md) so no secret ends up in the repo.
+  # database connection is created by scripts/superset_seed.py (make seed-superset).
   superset:
     image: apache/superset:4.1.1
     container_name: gaming-superset
@@ -210,6 +210,10 @@ services:
       SUPERSET_ADMIN_USER: ${SUPERSET_ADMIN_USER}
       SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
       SUPERSET_CONFIG_PATH: /app/superset_config.py
+      # Used by seed.py to create the ClickHouse connection (no UI clicking).
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
     entrypoint: ["sh", "-c", "pip install --no-cache-dir clickhouse-connect==0.7.19 && exec superset run -h 0.0.0.0 -p 8088"]
     command: []
     ports:
@@ -221,6 +225,10 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+      # Wait for migrations + admin creation; starting both at once races on
+      # the shared SQLite metadata DB and leaves no admin user.
+      superset-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8088/health || exit 1"]
       interval: 10s

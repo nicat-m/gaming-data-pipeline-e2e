@@ -3,8 +3,8 @@
 End-to-end data platform for a gaming-industry use case: which player
 segments and game titles drive revenue, and where do early churn signals
 show up in the session/purchase funnel. Built incrementally, phase by
-phase — this delivery covers **Phase 0: Infrastructure & Project
-Skeleton**. See [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md) for the full
+phase — this delivery covers **Phase 1: Walking Skeleton** (on top of the
+Phase 0 infrastructure), plus an early Superset dashboard. See [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md) for the full
 problem statement, data model, and phase roadmap.
 
 ## Architecture
@@ -53,7 +53,7 @@ Full component-by-component walkthrough: `docs/PROJECT_PLAN.md`, section 3.
 | Kafka observability | Kafka UI (Provectus) 0.7.2 |
 | Raw object storage | RustFS 1.0.0 (S3-compatible) |
 | Warehouse | ClickHouse 24.8 (columnar, ReplacingMergeTree raw) |
-| Transformation (dims/facts) | dbt-core 1.8.7 / dbt-postgres |
+| Transformation (dims/facts) | dbt-core 1.8.7 / dbt-clickhouse |
 | Batch processing (aggregates) | Apache Spark 3.5.3 (standalone master+worker) |
 | Orchestration | Apache Airflow 2.10.2 |
 | Containerization | Docker Compose |
@@ -64,16 +64,16 @@ Full justification and rejected alternatives: `docs/PROJECT_PLAN.md`, section 4.
 
 - Docker + Docker Compose v2
 - Python 3.11+
-- ~6-8 GB free RAM for the local stack (2x Postgres, Kafka, Kafka Connect,
-  RustFS, Spark master+worker, Airflow webserver+scheduler)
+- ~8 GB free RAM for the local stack (2x Postgres, ClickHouse, Kafka, Kafka
+  Connect, RustFS, Spark master+worker, Airflow webserver+scheduler, Superset)
 
 ## Setup
 
 ```bash
 git clone <repo-url> && cd gaming-data-pipeline-e2e
 cp .env.example .env
-# Edit .env and replace every <CHANGE_ME> — .env.example documents how to
-# generate each value (Fernet key, secret key, etc.). Never commit .env.
+# .env.example ships working LOCAL-DEV sample values - no edits needed to run.
+# Change them for any shared deployment. Never commit .env.
 
 # First `up` also BUILDS the custom Airflow image (orchestration/Dockerfile.airflow,
 # adds dbt + kafka client + boto3 + docker SDK to the stock Airflow image) —
@@ -82,8 +82,10 @@ docker compose -f infra/docker-compose.yml --env-file .env up -d
 docker compose -f infra/docker-compose.yml --env-file .env ps   # wait for all services "healthy"
 
 # Register the Debezium PostgreSQL source connector (idempotent — safe to re-run)
-set -a && source .env && set +a
-./infra/kafka-connect/register-connector.sh
+make register-connector
+
+# Create the Superset dashboard (idempotent)
+make seed-superset
 ```
 
 - Airflow UI: http://localhost:8080 (credentials: `AIRFLOW_ADMIN_USER` / `AIRFLOW_ADMIN_PASSWORD` from `.env`)
@@ -94,7 +96,6 @@ set -a && source .env && set +a
 - Superset (dashboard): http://localhost:8088 (credentials: `SUPERSET_ADMIN_*` from `.env`)
 - ClickHouse HTTP: `localhost:8123` (native: `localhost:9004`)
 - Postgres (source): `localhost:5433`, database from `SOURCE_POSTGRES_DB`
-- Postgres (warehouse): `localhost:5432`, database from `POSTGRES_DB`
 - Kafka broker: `localhost:9092`
 
 Local Python environment, for running the generator or tests outside Docker:
@@ -154,8 +155,9 @@ aws --endpoint-url http://localhost:9000 s3 ls s3://raw-game-events/serving/play
 
 **Idempotency / re-runs:** re-running the same logical date creates no
 duplicates — raw objects are keyed by Kafka offset range (overwritten),
-raw rows upsert via `ON CONFLICT (event_id) DO NOTHING`, curated models are
-full-refresh tables, serving is `CREATE OR REPLACE VIEW` + deterministic
+raw rows land in a ClickHouse `ReplacingMergeTree` ordered by
+`(source_partition_date, event_id)` (staging reads with `FINAL`, so duplicates
+are invisible downstream), curated models are full-refresh tables, serving is `CREATE OR REPLACE VIEW` + deterministic
 report key. Different logical dates coexist (`source_partition_date` /
 `dt=<date>` partitions).
 
@@ -182,14 +184,9 @@ stdout. See `docs/evidence/phase-1.md`.
 ## Stopping / Restarting Infrastructure
 
 ```bash
-# Stop, keep data (named volumes persist)
-docker compose -f infra/docker-compose.yml --env-file .env down
-
-# Restart — state (both Postgres instances, Kafka log, RustFS objects) survives
-docker compose -f infra/docker-compose.yml --env-file .env up -d
-
-# Full reset — deletes all volumes/state
-docker compose -f infra/docker-compose.yml --env-file .env down -v
+make down    # stop, keep data (named volumes persist)
+make up      # restart — state (Postgres, ClickHouse, Kafka log, RustFS objects) survives
+make clean   # full reset — deletes all volumes/state
 ```
 
 ## Project Structure
@@ -199,8 +196,9 @@ docker compose -f infra/docker-compose.yml --env-file .env down -v
 ├── docs/
 │   └── PROJECT_PLAN.md              # full plan: problem, data model, pipeline design, DQ, roadmap
 ├── infra/
-│   ├── docker-compose.yml           # postgres (source+warehouse), kafka, kafka-connect, rustfs, spark, airflow
-│   ├── postgres/init.sql            # creates raw / staging / curated schemas on first boot (warehouse)
+│   ├── docker-compose.yml           # source postgres, clickhouse, kafka, kafka-connect, rustfs, spark, airflow, superset
+│   ├── clickhouse/init.sql          # creates raw / staging / curated / serving databases on first boot
+│   ├── superset/superset_config.py  # Superset configuration
 │   ├── postgres-source/init.sql     # creates source.game_events OLTP table watched by Debezium
 │   └── kafka-connect/
 │       ├── postgres-source-connector.json  # Debezium PostgreSQL connector config
@@ -213,9 +211,9 @@ docker compose -f infra/docker-compose.yml --env-file .env down -v
 │   └── consumer/
 │       └── kafka_to_rustfs.py       # CLI: consumes the CDC topic, lands NDJSON batches in RustFS
 ├── orchestration/
-│   └── dags/gaming_pipeline_dag.py  # Airflow DAG skeleton (load -> dbt staging/curated + spark batch)
+│   └── dags/gaming_pipeline_dag.py  # gaming_pipeline DAG (ingest -> raw -> dbt staging/test/curated -> serving)
 ├── transformation/
-│   ├── dbt_gaming/                  # dbt project: staging passthrough model, curated dims/facts placeholder
+│   ├── dbt_gaming/                  # dbt project: staging model, curated dim_player + fct_in_game_transaction
 │   └── spark_jobs/
 │       └── daily_engagement_batch.py  # Spark batch job skeleton: RustFS -> agg_player_daily_engagement
 ├── config/
@@ -253,4 +251,5 @@ workflow (ruff + compile + compose validation). Evidence:
 
 **Still planned (later phases):** real Spark S3A aggregation (Phase 3),
 deeper transformations/SCD2 (Phase 2), streaming pipeline replacing the
-batch consumer (Phase 2+), BI dashboard (Phase 4).
+batch consumer (Phase 2+). The Superset dashboard (seeded from
+`scripts/superset_seed.py`) already exists as an early Phase 2 deliverable.
