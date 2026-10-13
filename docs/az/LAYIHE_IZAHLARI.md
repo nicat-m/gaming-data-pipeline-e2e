@@ -56,8 +56,7 @@ qoyub təsiri ölçür. Heç bir mühəndisə "mənə bu cədvəli eksport edər
 > Aşağıdakı mətn diaqramı eyni axının sadə ASCII versiyasıdır.
 
 ```
-Oyun (sintetik generator, real oyun ID-ləri) ──►  Source PostgreSQL (OLTP)
-FreeToGame API (real, oyun kataloqu) ──► Airflow: fetch_games_api ──► RustFS ──► raw.games_catalog ──► dim_game
+Oyun (sintetik generator, real oyun ID-ləri)  ──►  Source PostgreSQL (OLTP)
                                                 │  wal_level=logical
                                                 ▼
                                            Debezium (Kafka Connect)  ── CDC ──►  Apache Kafka (topic)
@@ -71,17 +70,25 @@ FreeToGame API (real, oyun kataloqu) ──► Airflow: fetch_games_api ──�
                                              ▼
                                         ClickHouse — RAW bazası (ReplacingMergeTree)
                                              │
+  FreeToGame API (real, açarsız, 419 oyun)   │
+        │ Airflow task: fetch_games_api      │
+        ▼                                    │
+  RustFS: raw/games_catalog/dt=<gün>/games.jsonl
+        │ Airflow task: load_games_to_clickhouse
+        ▼                                    │
+  ClickHouse RAW: raw.games_catalog ─────────┤  (hər iki mənbə staging-ə birləşir)
+                                             │
                                              │ Airflow task: dbt_run_staging
                                              ▼
-                                        ClickHouse — STAGING (tipləşdirilmiş 1:1 view)
+                                        ClickHouse — STAGING (stg_game_events, stg_games: tipləşdirilmiş view-lar)
                                              │
                                              │ Airflow task: dbt_test_staging  ◄── DQ darvazası
                                              ▼
-                                        ClickHouse — CURATED (dim_player, fct_in_game_transaction)
+                                        ClickHouse — CURATED (dim_player, dim_game, fct_in_game_transaction)
                                              │
                                              │ Airflow task: publish_serving
                                              ▼
-                                        ClickHouse — SERVING (SQL view) + RustFS-də CSV hesabat
+                                        ClickHouse — SERVING (v_player_engagement_daily, v_game_revenue) + RustFS-də CSV hesabatlar
                                              │
                                              ▼
                                   Apache Superset — analitik dashboard (8088)
@@ -98,15 +105,16 @@ dayanmadan işləyir (real oyundakı kimi).
 
 | Pipeline rolu | Komponent | Status |
 |---|---|---|
-| Mənbə sistem | Python generator → source Postgres (`source.game_events`) | ✅ |
+| Mənbə #1 (event-lər) | Python generator → source Postgres (`source.game_events`) | ✅ |
+| Mənbə #2 (oyun kataloqu) | FreeToGame public API → Airflow `fetch_games_api` (ADR 0003) | ✅ |
 | CDC / axın | Debezium PostgreSQL connector (Kafka Connect) | ✅ |
 | Yenidən oxunaq bufer | Kafka topic `gaming.source.game_events` | ✅ |
 | Raw zona (data lake) | RustFS bucket (`raw/game_events/dt=<gün>/`) | ✅ |
 | Anbar | **ClickHouse** (raw / staging / curated / serving bazaları) | ✅ |
-| Tipləşdirmə / kurasiya | dbt (dbt-clickhouse adapter) + DQ testləri | ✅ |
+| Tipləşdirmə / kurasiya | dbt (dbt-clickhouse adapter): `stg_game_events`, `stg_games`, `dim_player`, `dim_game`, `fct_in_game_transaction` + DQ testləri | ✅ |
 | Batch hesablama | Spark (Phase 1-də connectivity proof; real S3A işi Phase 3) | 📋 |
 | Orkestrasiya | Airflow `gaming_pipeline` DAG (logical-date parametrli) | ✅ |
-| Serving | `serving.v_player_engagement_daily` view + CSV hesabat | ✅ |
+| Serving | `serving.v_player_engagement_daily` və `serving.v_game_revenue` view-ları + CSV hesabatlar | ✅ |
 | Dashboard | Apache Superset (ClickHouse-a qoşulur) | ✅ |
 
 ---
