@@ -55,6 +55,7 @@ with app.app_context():
         ("curated", "fct_in_game_transaction"),
         ("serving", "v_player_engagement_daily"),
         ("serving", "v_game_revenue"),
+        ("serving", "v_pipeline_health"),
     ]
     datasets: dict[str, SqlaTable] = {}
     for schema, table in wanted_datasets:
@@ -240,6 +241,56 @@ with app.app_context():
                 "y_axis_format": "SMART_NUMBER",
             },
         ),
+        make_chart(
+            "duplicate_rows_kpi",
+            "Duplicate rows across all layers (must be 0)",
+            "big_number_total",
+            "serving.v_pipeline_health",
+            {
+                "metric": {"expressionType": "SIMPLE", "column": {"column_name": "duplicate_rows"},
+                           "aggregate": "SUM", "label": "duplicate rows"},
+                "subheader": "idempotency check: rows minus distinct keys",
+                "y_axis_format": "SMART_NUMBER",
+            },
+        ),
+        make_chart(
+            "layer_counts_table",
+            "Rows per layer and logical date",
+            "table",
+            "serving.v_pipeline_health",
+            {
+                "query_mode": "aggregate",
+                "groupby": ["layer", "logical_date"],
+                "metrics": [
+                    {"expressionType": "SIMPLE", "column": {"column_name": "row_count"},
+                     "aggregate": "SUM", "label": "rows"},
+                    {"expressionType": "SIMPLE", "column": {"column_name": "distinct_keys"},
+                     "aggregate": "SUM", "label": "distinct keys"},
+                    {"expressionType": "SIMPLE", "column": {"column_name": "duplicate_rows"},
+                     "aggregate": "SUM", "label": "duplicates"},
+                ],
+                "all_columns": [],
+                "order_desc": False,
+                "row_limit": 100,
+                "page_length": 20,
+            },
+        ),
+        make_chart(
+            "top_players",
+            "Top 10 players by spend",
+            "table",
+            "serving.v_player_engagement_daily",
+            {
+                "query_mode": "raw",
+                "all_columns": ["player_id", "country", "transactions", "total_amount_usd", "last_txn_at"],
+                "groupby": [],
+                "metrics": [],
+                "order_by_cols": ['["total_amount_usd", false]'],
+                "row_limit": 10,
+                "page_length": 10,
+                "include_search": False,
+            },
+        ),
     ]
 
     # --------------------------------------------------------------- dashboard
@@ -282,19 +333,24 @@ with app.app_context():
         (charts[5].id, "KPI: players / events / revenue"),
         (charts[6].id, "Revenue by game genre"),
         (charts[7].id, "Top 10 games by revenue"),
+        (charts[8].id, "Duplicate rows across all layers (must be 0)"),
+        (charts[9].id, "Rows per layer and logical date"),
+        (charts[10].id, "Top 10 players by spend"),
     ]
     node_by_id: dict[str, dict] = {}
     row_ids: list[str] = []
-    for row_idx in range(len(chart_specs) // 2):
+    for row_idx in range((len(chart_specs) + 1) // 2):
         row_id = f"ROW-{row_idx}"
         chart_ids: list[str] = []
-        for col_idx in range(2):
+        row_specs = chart_specs[row_idx * 2: row_idx * 2 + 2]
+        for col_idx, (chart_id, slice_name) in enumerate(row_specs):
             node_id = f"CHART-{row_idx}-{col_idx}"
-            chart_id, slice_name = chart_specs[row_idx * 2 + col_idx]
             node_by_id[node_id] = _chart_node(
                 chart_id, node_id, slice_name,
                 ["ROOT_ID", "GRID_ID", row_id],
             )
+            if len(row_specs) == 1:  # odd chart count: last chart spans the full row
+                node_by_id[node_id]["meta"]["width"] = 12
             chart_ids.append(node_id)
         node_by_id[row_id] = _row_node(row_id, chart_ids, ["ROOT_ID", "GRID_ID"])
         row_ids.append(row_id)

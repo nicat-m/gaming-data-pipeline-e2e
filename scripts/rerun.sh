@@ -8,6 +8,8 @@ EXEC_DATE="${DS}T00:00:00+00:00"
 
 COMPOSE="docker compose -f infra/docker-compose.yml --env-file .env"
 AF="$COMPOSE exec -T airflow-scheduler"
+# The DAG ships paused (task requirement); a manual run needs it unpaused.
+$AF airflow dags unpause gaming_pipeline >/dev/null 2>&1 || true
 EXISTING="$($AF airflow dags state gaming_pipeline "${EXEC_DATE}" 2>/dev/null | tail -1 | tr -d '[:space:]')"
 # `dags state` exits 0 and prints "None" when no run exists for the date.
 if [ -n "${EXISTING}" ] && [ "${EXISTING}" != "None" ]; then

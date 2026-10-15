@@ -1,6 +1,6 @@
 # ADR 0001 — Spark batch job (RustFS S3A → curated aggregate) deferred to Phase 3
 
-Date: 2026-10-09 · Status: accepted · Phase: 1
+Date: 2026-10-09 · Status: **superseded by ADR 0004** (Spark removed) · Phase: 1
 
 ## Context
 

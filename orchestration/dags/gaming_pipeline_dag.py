@@ -11,10 +11,6 @@ Gaming Lakehouse batch pipeline - Phase 1 walking skeleton.
         -> dbt_run_curated              (curated: dim_player, dim_game, fct_in_game_transaction)
         -> publish_serving              (serving: SQL views + CSV reports on RustFS)
 
-    spark_connectivity_proof            (parallel: proves the Spark cluster is
-                                         integrated; the real S3A batch job is
-                                         Phase 3, see docs/decisions/0001-*.md)
-
 The generator and CDC are NOT orchestrated here: events flow
 generator -> source Postgres -> Debezium/Kafka Connect -> Kafka continuously
 and independently. This DAG owns the batch slice from the Kafka topic onward
@@ -279,36 +275,10 @@ def load_games_to_clickhouse(partition_date: str, **_context) -> int:
     return len(rows)
 
 
-def spark_connectivity_proof(**_context) -> None:
-    """Connectivity proof for the Spark component (Phase 1): run a trivial
-    spark-submit inside the Spark container. The real S3A batch job is
-    Phase 3 - docs/decisions/0001-spark-batch-s3a-phase3.md.
-    """
-    import docker
-
-    task = "spark_connectivity_proof"
-    _print(task, "start: docker exec gaming-spark-master spark-submit connectivity_proof.py")
-    client = docker.from_env()
-    # HOME must point at a writable dir: the Bitnami Spark image resolves the
-    # ivy cache under $HOME/.ivy2 and fails with "basedir must be absolute: ?/.ivy2/local"
-    # when HOME is unset/"/" (as it is for a bare exec without the image's entrypoint).
-    result = client.containers.get(os.getenv("SPARK_CONTAINER_NAME", "gaming-spark-master")).exec_run(
-        cmd=[
-            "sh", "-c",
-            "export HOME=/opt/bitnami/spark; "
-            "spark-submit --master local[1] /opt/spark-apps/connectivity_proof.py",
-        ],
-    )
-    output = result.output.decode(errors="replace")
-    print(output[-2000:])
-    if result.exit_code != 0:
-        raise AirflowFailException(f"Spark connectivity proof failed (exit={result.exit_code})")
-    _print(task, "end: spark-submit succeeded")
-
-
 def publish_serving(partition_date: str, **_context) -> None:
     """Serving task: expose curated objects for consumers - SQL views
-    (`serving.v_player_engagement_daily`, `serving.v_game_revenue`, queryable
+    (`serving.v_player_engagement_daily`, `serving.v_game_revenue`,
+    `serving.v_pipeline_health`, queryable
     by Superset / any SQL client) and a CSV report per view exported to RustFS
     under serving/<view>/dt=<ds>/report.csv.
 
@@ -344,6 +314,27 @@ def publish_serving(partition_date: str, **_context) -> None:
             FROM curated.fct_in_game_transaction f
             JOIN curated.dim_game g ON f.game_id = g.game_id
             GROUP BY g.game_id, g.title, g.genre, g.publisher, g.platform
+        """,
+        # Pipeline health: physical row count vs distinct keys per layer and
+        # logical date. duplicate_rows must be 0 everywhere (idempotency proof).
+        "v_pipeline_health": """
+            CREATE OR REPLACE VIEW serving.v_pipeline_health AS
+            SELECT 'raw.game_events' AS layer, source_partition_date AS logical_date,
+                   count() AS row_count, uniq(event_id) AS distinct_keys,
+                   toInt64(count()) - toInt64(uniq(event_id)) AS duplicate_rows
+            FROM raw.game_events GROUP BY source_partition_date
+            UNION ALL
+            SELECT 'raw.games_catalog', source_partition_date,
+                   count(), uniq(game_id), toInt64(count()) - toInt64(uniq(game_id))
+            FROM raw.games_catalog GROUP BY source_partition_date
+            UNION ALL
+            SELECT 'staging.stg_game_events', toString(source_partition_date),
+                   count(), uniq(event_id), toInt64(count()) - toInt64(uniq(event_id))
+            FROM staging.stg_game_events GROUP BY source_partition_date
+            UNION ALL
+            SELECT 'curated.fct_in_game_transaction', toString(source_partition_date),
+                   count(), uniq(event_id), toInt64(count()) - toInt64(uniq(event_id))
+            FROM curated.fct_in_game_transaction GROUP BY source_partition_date
         """,
     }
     client = _get_clickhouse_client()
@@ -422,11 +413,6 @@ with DAG(
         op_kwargs={"partition_date": "{{ ds }}"},
     )
 
-    spark_proof = PythonOperator(
-        task_id="spark_connectivity_proof",
-        python_callable=spark_connectivity_proof,
-    )
-
     dbt_run_staging = BashOperator(
         task_id="dbt_run_staging",
         bash_command=(
@@ -464,4 +450,3 @@ with DAG(
     fetch_games >> load_games
     [load_raw, load_games] >> dbt_run_staging
     dbt_run_staging >> dbt_test_staging >> dbt_run_curated >> publish
-    spark_proof

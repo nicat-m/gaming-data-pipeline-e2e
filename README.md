@@ -21,8 +21,6 @@ flowchart LR
     AF[Airflow DAG ✅] --> CH[(ClickHouse: raw/staging/curated ✅)]
     CH --> STG[dbt staging ✅]
     STG -->|dbt tests ✅ DQ gate| CUR[dbt curated: dim + fact ✅]
-    RUSTFS -.->|S3A read| SPARK[Spark batch job 📋 Phase 3]
-    SPARK -.->|JDBC| CUR
     CUR --> VIEWS[Serving: SQL view + CSV report ✅]
 ```
 
@@ -38,7 +36,6 @@ Component roles (pipeline ↔ component mapping):
 | Streaming buffer | Kafka topic `gaming.source.game_events` |
 | Raw landing zone | RustFS bucket (`raw/game_events/dt=<date>/`) — orchestrated consumer task |
 | Warehouse (raw/staging/curated/serving) | ClickHouse + dbt-clickhouse (tests act as the DQ gate) |
-| Batch compute | Spark — connectivity proof now, real S3A job in Phase 3 (ADR 0001) |
 | Orchestration | Airflow `gaming_pipeline` DAG (logical-date parameterised) |
 | Serving | `serving.v_player_engagement_daily` and `serving.v_game_revenue` SQL views + CSV reports on RustFS |
 | Dashboard | Apache Superset (auto-refresh charts on ClickHouse) |
@@ -57,7 +54,6 @@ Full component-by-component walkthrough: `docs/PROJECT_PLAN.md`, section 3.
 | Raw object storage | RustFS 1.0.0 (S3-compatible) |
 | Warehouse | ClickHouse 24.8 (columnar, ReplacingMergeTree raw) |
 | Transformation (dims/facts) | dbt-core 1.8.7 / dbt-clickhouse |
-| Batch processing (aggregates) | Apache Spark 3.5.3 (standalone master+worker) |
 | Orchestration | Apache Airflow 2.10.2 |
 | Containerization | Docker Compose |
 
@@ -68,7 +64,7 @@ Full justification and rejected alternatives: `docs/PROJECT_PLAN.md`, section 4.
 - Docker + Docker Compose v2
 - Python 3.11+
 - ~8 GB free RAM for the local stack (2x Postgres, ClickHouse, Kafka, Kafka
-  Connect, RustFS, Spark master+worker, Airflow webserver+scheduler, Superset)
+  Connect, RustFS, Airflow webserver+scheduler, Superset)
 
 ## Setup
 
@@ -96,7 +92,6 @@ make register-connector
 - **Control panel: http://localhost:8099** (`make portal`) — one page with every service link, a health dot and copyable credentials (generated from `.env`, bound to localhost only)
 - Airflow UI: http://localhost:8080 (credentials: `AIRFLOW_ADMIN_USER` / `AIRFLOW_ADMIN_PASSWORD` from `.env`)
 - RustFS console: http://localhost:9001
-- Spark master UI: http://localhost:8081
 - Kafka Connect REST API: http://localhost:8083
 - Kafka UI: http://localhost:8085
 - Superset (dashboard): http://localhost:8088 (credentials: `SUPERSET_ADMIN_*` from `.env`)
@@ -137,7 +132,6 @@ DAG shape (each stage a separate task, explicit dependencies):
 ```
 land_raw_kafka_to_rustfs ─▶ load_raw_to_clickhouse ─┐
 fetch_games_api ─▶ load_games_to_clickhouse ────────┴─▶ dbt_run_staging ─▶ dbt_test_staging ─▶ dbt_run_curated ─▶ publish_serving
-spark_connectivity_proof (parallel — Spark integration proof, see docs/decisions/0001)
 ```
 
 **Expected result:** the run reaches `success`; the layer row counts from
@@ -148,10 +142,10 @@ dropped). Sample per-layer verification:
 ```bash
 # raw + staging + curated + serving (warehouse)
 docker exec gaming-clickhouse clickhouse-client --query "
-  SELECT 'raw' layer, count(*) FROM gaming_lakehouse.raw.game_events
-  UNION ALL SELECT 'staging', count(*) FROM gaming_lakehouse.staging.stg_game_events
-  UNION ALL SELECT 'fct', count(*) FROM gaming_lakehouse.curated.fct_in_game_transaction
-  UNION ALL SELECT 'serving', count(*) FROM gaming_lakehouse.serving.v_player_engagement_daily"
+  SELECT 'raw' layer, count(*) FROM raw.game_events
+  UNION ALL SELECT 'staging', count(*) FROM staging.stg_game_events
+  UNION ALL SELECT 'fct', count(*) FROM curated.fct_in_game_transaction
+  UNION ALL SELECT 'serving', count(*) FROM serving.v_player_engagement_daily"
 
 # raw objects in RustFS (dt=<logical date> partitions)
 aws --endpoint-url http://localhost:9000 s3 ls s3://raw-game-events/raw/game_events/ --recursive
@@ -206,7 +200,7 @@ make clean   # full reset — deletes all volumes/state
 ├── docs/
 │   └── PROJECT_PLAN.md              # full plan: problem, data model, pipeline design, DQ, roadmap
 ├── infra/
-│   ├── docker-compose.yml           # source postgres, clickhouse, kafka, kafka-connect, rustfs, spark, airflow, superset
+│   ├── docker-compose.yml           # source postgres, clickhouse, kafka, kafka-connect, rustfs, airflow, superset
 │   ├── clickhouse/init.sql          # creates raw / staging / curated / serving databases on first boot
 │   ├── superset/superset_config.py  # Superset configuration
 │   ├── postgres-source/init.sql     # creates source.game_events OLTP table watched by Debezium
@@ -224,8 +218,6 @@ make clean   # full reset — deletes all volumes/state
 │   └── dags/gaming_pipeline_dag.py  # gaming_pipeline DAG (ingest -> raw -> dbt staging/test/curated -> serving)
 ├── transformation/
 │   ├── dbt_gaming/                  # dbt project: staging model, curated dim_player + fct_in_game_transaction
-│   └── spark_jobs/
-│       └── daily_engagement_batch.py  # Spark batch job skeleton: RustFS -> agg_player_daily_engagement
 ├── config/
 │   └── settings.py                  # single source of truth for all environment configuration
 ├── tests/
@@ -237,7 +229,7 @@ make clean   # full reset — deletes all volumes/state
 
 Every top-level directory maps directly to a stage in the architecture
 diagram above: `ingestion` = source + ingestion, `infra` = storage/warehouse
-infrastructure, `transformation` = transformation (both dbt and Spark),
+infrastructure, `transformation` = transformation (dbt),
 `orchestration` = scheduling, `config` = central configuration, `tests` =
 automated checks, `docs` = planning and design documentation.
 
@@ -245,21 +237,19 @@ automated checks, `docs` = planning and design documentation.
 
 **Phase 0 (done):** Docker Compose stack (source Postgres CDC-enabled,
 ClickHouse warehouse, Airflow metadata DB, Kafka, Kafka Connect, RustFS,
-Spark, Superset) with pinned images, healthchecks and persistent volumes;
+Superset) with pinned images, healthchecks and persistent volumes;
 schemas + source table on first boot; generator, DB writer and
 Kafka-to-RustFS consumer CLIs, unit-tested.
 
 **Phase 1 (done):** the batch slice runs end to end inside Airflow:
 `land_raw_kafka_to_rustfs → load_raw_to_clickhouse → dbt_run_staging →
-dbt_test_staging (DQ gate) → dbt_run_curated → publish_serving`, plus a
-parallel `spark_connectivity_proof` (real S3A batch job = Phase 3, ADR 0001).
+dbt_test_staging (DQ gate) → dbt_run_curated → publish_serving`.
 Logical-date parameterised, idempotent re-runs, restart-safe, deliberate
 failure switch (`PIPELINE_FAIL_SWITCH`), 8 DQ checks that can fail the run,
 serving view + CSV report, one-command smoke test (`make smoke`), CI
 workflow (ruff + compile + compose validation). Evidence:
 `docs/evidence/phase-1.md`.
 
-**Still planned (later phases):** real Spark S3A aggregation (Phase 3),
-deeper transformations/SCD2 (Phase 2), streaming pipeline replacing the
+**Still planned (later phases):** deeper transformations/SCD2 (Phase 2), streaming pipeline replacing the
 batch consumer (Phase 2+). The Superset dashboard (seeded from
 `scripts/superset_seed.py`) already exists as an early Phase 2 deliverable.

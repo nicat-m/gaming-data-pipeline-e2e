@@ -1,9 +1,8 @@
 # Custom Airflow image for the Gaming Lakehouse pipeline.
 #
 # The stock apache/airflow image has no dbt, no Kafka client and no boto3,
-# so the DAG's tasks (dbt run/test, Kafka consumer, RustFS writes, docker
-# exec for the Spark connectivity proof) could not run inside the
-# orchestrator. Everything is pinned to the same versions as
+# so the DAG's tasks (dbt run/test, Kafka consumer, RustFS writes) could not
+# run inside the orchestrator. Everything is pinned to the same versions as
 # requirements.txt so host and orchestrator environments agree.
 #
 # Built automatically by `docker compose up -d` (see the `build:` key on
@@ -14,12 +13,9 @@ COPY requirements.txt /tmp/requirements.txt
 
 # dbt is deliberately NOT in requirements.txt (it is only needed inside the
 # orchestrator image); the rest of the pins match the host environment.
-# pyspark is skipped: it is only needed by the standalone Spark containers,
-# not inside Airflow, and would bloat this image by ~300MB.
 RUN pip install --no-cache-dir \
     "dbt-core==1.8.7" \
     "dbt-clickhouse==1.8.1" \
-    "docker==7.1.0" \
-    && grep -v -e '^pyspark' -e '^\s*#' -e '^\s*$' /tmp/requirements.txt \
+    && grep -v -e '^\s*#' -e '^\s*$' /tmp/requirements.txt \
       > /tmp/requirements-airflow.txt \
     && pip install --no-cache-dir -r /tmp/requirements-airflow.txt
