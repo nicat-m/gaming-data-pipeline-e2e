@@ -30,7 +30,7 @@ rəqəmləri görür).
 | Dəyər | İzah |
 |---|---|
 | **Gəlir perspektivi ilə davranış** | Sessiya (pulsuz davranış) və alış-veriş (pul) hadisələri **bir** kurasiya modelində birləşir — "hansı seqment ödəyir" sualı üç analitikin bir həftəlik əl işi yox, hazır cədvəldir. |
-| **Erkən churn siqnalı** | `agg_player_daily_engagement` (Spark, Phase 3) hər oyunçunun gündəlik aktivliyini verir. Sessiya başlayıb təkrar oynamayan seqment **hələ itkin çatmayana qədər** retensiya kampaniyasına düşür — geri qaytarmaq itkinlərdən 5–25 dəfə baha başa gəlir. |
+| **Erkən churn siqnalı** | `agg_player_daily_engagement` (planlaşdırılan dbt modeli) hər oyunçunun gündəlik aktivliyini verir. Sessiya başlayıb təkrar oynamayan seqment **hələ itkin çatmayana qədər** retensiya kampaniyasına düşür — geri qaytarmaq itkinlərdən 5–25 dəfə baha başa gəlir. |
 | **Büdcə sübutla bölünür** | Haftalıq Growth iclası kampaniya pulunu eyni kurasiya cədvəllərindən bölür — finance rəqəmləri ilə uzlaşan, test olunmuş, **bir** mənbədən. |
 | **Bir etibarlı "player truth"** | Raw lay qeydiyyatdan keçmiş hər hadisəni itirmir (append-only), kurasiya layı dbt testləri ilə yoxlanılır. Product, finance və marketinq eyni `player_id` açarlı rəqəmləri görür. |
 | **Yeni sual ucuzlaşır** | CDC axını qurulduqdan sonra yeni analitik sual ("A/B cohort-u olanlar daha çox alış edirmi?") mövcud tarixin üstündə yeni bir dbt model deməkdir — yeni bir backfill layihəsi deyil. |
@@ -56,42 +56,36 @@ qoyub təsiri ölçür. Heç bir mühəndisə "mənə bu cədvəli eksport edər
 > Aşağıdakı mətn diaqramı eyni axının sadə ASCII versiyasıdır.
 
 ```
-Oyun (sintetik generator, real oyun ID-ləri)  ──►  Source PostgreSQL (OLTP)
-                                                │  wal_level=logical
-                                                ▼
-                                           Debezium (Kafka Connect)  ── CDC ──►  Apache Kafka (topic)
-                                                                                        │
-                                             ┌──────────────────────────────────────────┘
-                                             │ Airflow task: land_raw_kafka_to_rustfs
-                                             ▼
-                                        RustFS (S3-uyumlu raw zona, NDJSON fayllar)
-                                             │
-                                             │ Airflow task: load_raw_to_clickhouse
-                                             ▼
-                                        ClickHouse — RAW bazası (ReplacingMergeTree)
-                                             │
-  FreeToGame API (real, açarsız, 419 oyun)   │
-        │ Airflow task: fetch_games_api      │
-        ▼                                    │
-  RustFS: raw/games_catalog/dt=<gün>/games.jsonl
-        │ Airflow task: load_games_to_clickhouse
-        ▼                                    │
-  ClickHouse RAW: raw.games_catalog ─────────┤  (hər iki mənbə staging-ə birləşir)
-                                             │
-                                             │ Airflow task: dbt_run_staging
-                                             ▼
-                                        ClickHouse — STAGING (stg_game_events, stg_games: tipləşdirilmiş view-lar)
-                                             │
-                                             │ Airflow task: dbt_test_staging  ◄── DQ darvazası
-                                             ▼
-                                        ClickHouse — CURATED (dim_player, dim_game, fct_in_game_transaction)
-                                             │
-                                             │ Airflow task: publish_serving
-                                             ▼
-                                        ClickHouse — SERVING (v_player_engagement_daily, v_game_revenue) + RustFS-də CSV hesabatlar
-                                             │
-                                             ▼
-                                  Apache Superset — analitik dashboard (8088)
+ MƏNBƏ #1: oyunçu event-ləri                                 MƏNBƏ #2: oyun kataloqu
+ Python generator (real oyun ID-ləri, 5% çirkli)             FreeToGame public API (açarsız, ~420 oyun)
+        │ INSERT (db_writer.py)                                     │
+        ▼                                                           │
+ Source PostgreSQL (OLTP, wal_level=logical)                        │
+        │ WAL / logical replication                                 │
+        ▼                                                           │
+ Debezium (Kafka Connect) ─ JSON {before,after,op} ─► Kafka topic   │
+                                         │                          │
+              Airflow: land_raw_kafka_to_rustfs        Airflow: fetch_games_api (HTTP GET, retry 3×)
+                                         ▼                          ▼
+        RustFS raw/game_events/dt=<gün>/<ilk>-<son>.jsonl    RustFS raw/games_catalog/dt=<gün>/games.jsonl
+                                         │                          │
+              Airflow: load_raw_to_clickhouse          Airflow: load_games_to_clickhouse
+                                         ▼                          ▼
+              ClickHouse raw.game_events               ClickHouse raw.games_catalog
+                                         └────────────┬─────────────┘
+                                                      │ Airflow: dbt_run_staging
+                                                      ▼
+                       staging.stg_game_events, staging.stg_games   (tipləşdirilmiş view-lar)
+                                                      │ Airflow: dbt_test_staging  ◄── DQ darvazası (8 yoxlama)
+                                                      ▼
+              curated.dim_player, curated.dim_game, curated.fct_in_game_transaction
+                                                      │ Airflow: publish_serving
+                                                      ▼
+       serving.v_player_engagement_daily · v_game_revenue · v_pipeline_health
+                 + RustFS-də CSV hesabatlar: serving/<view>/dt=<gün>/report.csv
+                                                      │ SQL (HTTP 8123)
+                                                      ▼
+                                      Apache Superset dashboard (:8088)
 ```
 
 **İki mənbə:** (1) event-lər: generator → Postgres → CDC → Kafka; (2) oyun kataloqu: real FreeToGame API. İkisi staging/curated qatında `game_id` ilə birləşir (oyun/janr üzrə gəlir).
@@ -112,7 +106,6 @@ dayanmadan işləyir (real oyundakı kimi).
 | Raw zona (data lake) | RustFS bucket (`raw/game_events/dt=<gün>/`) | ✅ |
 | Anbar | **ClickHouse** (raw / staging / curated / serving bazaları) | ✅ |
 | Tipləşdirmə / kurasiya | dbt (dbt-clickhouse adapter): `stg_game_events`, `stg_games`, `dim_player`, `dim_game`, `fct_in_game_transaction` + DQ testləri | ✅ |
-| Batch hesablama | Spark (Phase 1-də connectivity proof; real S3A işi Phase 3) | 📋 |
 | Orkestrasiya | Airflow `gaming_pipeline` DAG (logical-date parametrli) | ✅ |
 | Serving | `serving.v_player_engagement_daily` və `serving.v_game_revenue` view-ları + CSV hesabatlar | ✅ |
 | Dashboard | Apache Superset (ClickHouse-a qoşulur) | ✅ |
@@ -215,7 +208,6 @@ bilmək üçün komanda tarixçəsinə baxmaq kifayətdir** və köhnə günü y
 ```
 land_raw_kafka_to_rustfs ─► load_raw_to_clickhouse ─┐
 fetch_games_api ─► load_games_to_clickhouse ───────┴─► dbt_run_staging ─► dbt_test_staging ─► dbt_run_curated ─► publish_serving
-spark_connectivity_proof (paralel)
 ```
 
 - **land_raw_kafka_to_rustfs**: Kafka istehlakçısı bounded işləyir — `max_batches=25`
@@ -231,19 +223,15 @@ spark_connectivity_proof (paralel)
 - **load_games_to_clickhouse**: `raw.games_catalog`-a delete-then-insert (həmin tarix üçün).
 - Retry siyasəti: Kafka task-ı 2, games API task-ı 3, qalanları 2 dəfə; hamısı 1 dəqiqə fasilə ilə.
 
-### 3.8 Spark: niyə hələlik yalnız connectivity proof?
+### 3.8 Niyə Spark yoxdur?
 
-Phase 1 tələbi: hər komponent ya **pipeline-da istifadə olunur**, ya da
-**sənədləşdirilmiş connectivity proof ilə örtülür**. Spark üçün real S3A batch işi
-Phase 3-dür (RustFS-dən oxuyub `agg_player_daily_engagement` yazır); Phase 1-də
-`spark_connectivity_proof` taskı Spark konteynerində real `spark-submit` işlədir
-(HOME/ivy problemi həll edilmiş). Tam əsaslandırma: `docs/decisions/0001-spark-batch-s3a-phase3.md`.
+Spark əvvəl yalnız connectivity proof idi (Airflow task-ı 1000 ədədi sayırdı) və heç bir data qatı ondan asılı deyildi. Bizim həcmdə (gündə bir neçə min sətir) bütün aqreqatlar ClickHouse və dbt ilə həll olunur, ona görə Spark arxitekturadan çıxarıldı (2 konteyner, ~1 GB RAM, Airflow-a docker socket mount). Həcm artarsa və ya SQL-ə sığmayan iş çıxarsa, yeni ADR ilə geri qaytarıla bilər. Əsaslandırma: `docs/decisions/0004-remove-spark.md`.
 
 ### 3.9 Təhlükəsizlik və gizli məlumatlar
 
 - Heç bir real secret repoda yoxdur: `.env` gitignore-dadır. `.env.example` yalnız **lokal dev** üçün nümunə dəyərlər saxlayır (dəyişmədən işləyir); paylaşılan mühitdə mütləq dəyişdirilməlidir.
 - dbt profili `env_var()` ilə işləyir — repoya kommit oluna bilər.
-- Airflow container-ların docker socket-i **read-only** mount-dur (yalnız Spark proof).
+- Airflow konteynerlərinə host-un docker socket-i mount edilmir.
 - Bütün qoşulma məlumatları (host, port, bucket, parol) mərkəzi `config/settings.py` vasitəsilə `.env`-dən oxunur; kodda sabit dəyər yoxdur.
 
 ### 3.10 CI (GitHub Actions)
@@ -301,7 +289,7 @@ canlı yenilənir (mənbə: ClickHouse-dan birbaşa sorğu — sürətli, saniy�
 1. `make up` — `superset-init` konteyneri migrasiyanı edir, admin istifadəçi yaradır
    (login: `.env`-də `SUPERSET_ADMIN_USER` / `SUPERSET_ADMIN_PASSWORD`).
 2. **Pipeline ilk dəfə işlədikdən sonra** (`make smoke`) `make seed-superset` — dataset-lər pipeline-ın yaratdığı cədvəllərdən oxuyur, onlar olmadan chart-lar boş çıxır. [scripts/superset_seed.py](../../scripts/superset_seed.py)
-   ClickHouse bağlantısını, dataset-ləri, 6 chart-ı və
+   ClickHouse bağlantısını, dataset-ləri, 11 chart-ı (o cümlədən pipeline sağlamlığı: "Duplicate rows (must be 0)" və "Rows per layer and logical date") və
    "Gaming Lakehouse — Live Overview" dashboard-unu yaradır (idempotent).
 3. Aç: `http://localhost:8088`.
 
@@ -364,10 +352,10 @@ Gözlənilən nəticə: Airflow-da `gaming_pipeline` run-u `success`, smoke sonu
 
 ```bash
 docker exec gaming-clickhouse clickhouse-client --query "
-  SELECT 'raw', count(*) FROM gaming_lakehouse.raw.game_events
-  UNION ALL SELECT 'staging', count(*) FROM gaming_lakehouse.staging.stg_game_events
-  UNION ALL SELECT 'fct', count(*) FROM gaming_lakehouse.curated.fct_in_game_transaction
-  UNION ALL SELECT 'serving', count(*) FROM gaming_lakehouse.serving.v_player_engagement_daily"
+  SELECT 'raw', count(*) FROM raw.game_events
+  UNION ALL SELECT 'staging', count(*) FROM staging.stg_game_events
+  UNION ALL SELECT 'fct', count(*) FROM curated.fct_in_game_transaction
+  UNION ALL SELECT 'serving', count(*) FROM serving.v_player_engagement_daily"
 ```
 
 Loglar: Airflow UI → `gaming_pipeline` → task → Logs, və ya
@@ -395,7 +383,7 @@ make clean     # TAM sıfırlama: bütün volume-lar silinir
 > qeydiyyatı, Superset dashboard). Yenidən `make register-connector`,
 > `make seed-superset` və `make smoke` (yeni event yaradır) lazımdır.
 
-Brauzerlər: Airflow `8080` · Superset `8088` · Kafka UI `8085` · Spark UI `8081` ·
+Brauzerlər: Airflow `8080` · Superset `8088` · Kafka UI `8085` ·
 RustFS konsol `9001` · ClickHouse HTTP `8123`.
 
 ### 5.7 Tez-tez rast gəlinən problemlər
@@ -413,13 +401,11 @@ RustFS konsol `9001` · ClickHouse HTTP `8123`.
 | Phase 0 | İnfrastruktur + skeleton | ✅ |
 | Phase 1 | Walking skeleton: Kafka→RustFS→raw→dbt→serving, DQ, smoke, CI | ✅ |
 | Phase 2 | **ClickHouse anbarı + Superset dashboard** (bu dəyişiklik) | ✅ |
-| Phase 3 | Real Spark S3A batch (`agg_player_daily_engagement`) | 📋 |
+| Phase 3 | `agg_player_daily_engagement` dbt modeli kimi (Spark çıxarılıb, ADR 0004) | 📋 |
 | Phase 4 | Streaming kəsimi + BI/ML genişlənmə | 📋 |
 
 ## 7. Risklər və qeydlər
 
-- `bitnamilegacy/spark:3.5.3` — Bitnami 2025 registry dəyişikliyi səbəbilə legacy
-  repo; Phase 3-də rəsmi `apache/spark` image-ə keçid tövsiyə olunur.
 - Superset image-ə `clickhouse-connect` boot-da pip ilə quraşdırılır (ilk start
   internet tələb edir). Tam offline üçün custom image tövsiyə olunur.
 - ClickHouse host port 9004 ← konteyner 9000 (RustFS 9000-i tutur).

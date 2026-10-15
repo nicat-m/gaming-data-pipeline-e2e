@@ -76,10 +76,6 @@ class KafkaConnectSettings(BaseModel):
     url: str = os.getenv("KAFKA_CONNECT_URL", "http://localhost:8083")
 
 
-class SparkSettings(BaseModel):
-    master_url: str = os.getenv("SPARK_MASTER_URL", "spark://localhost:7077")
-
-
 class KafkaSettings(BaseModel):
     bootstrap_servers: str = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
     topic_game_events: str = os.getenv("KAFKA_TOPIC_GAME_EVENTS", "game_events")
@@ -111,7 +107,6 @@ class Settings(BaseModel):
     source_postgres: SourcePostgresSettings = SourcePostgresSettings()
     kafka: KafkaSettings = KafkaSettings()
     kafka_connect: KafkaConnectSettings = KafkaConnectSettings()
-    spark: SparkSettings = SparkSettings()
     rustfs: RustFSSettings = RustFSSettings()
     generator: GeneratorSettings = GeneratorSettings()
     games_api: GamesApiSettings = GamesApiSettings()

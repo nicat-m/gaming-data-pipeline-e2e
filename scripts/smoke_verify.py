@@ -73,6 +73,9 @@ def main() -> int:
         "INNER JOIN curated.dim_game g ON f.game_id = g.game_id"
     ).result_rows[0][0]
     game_revenue_rows = client.query("SELECT count(*) FROM serving.v_game_revenue").result_rows[0][0]
+    health_duplicates = client.query(
+        "SELECT sum(duplicate_rows) FROM serving.v_pipeline_health"
+    ).result_rows[0][0]
 
     from ingestion.consumer.kafka_to_rustfs import _get_s3_client
 
@@ -103,6 +106,7 @@ def main() -> int:
     print(f"  fact rows matched to game | {fct_matched} of {fct_count} "
           f"(unmatched = events with ids outside the catalog)")
     print(f"serving v_game_revenue rows | {game_revenue_rows}")
+    print(f"duplicate rows, all layers  | {health_duplicates}   (serving.v_pipeline_health)")
     print("raw rows per logical date   | date: rows (distinct events)")
     for d, n, u in raw_by_date:
         print(f"  {d}                | {n} ({u})")
@@ -134,6 +138,8 @@ def main() -> int:
         )
     if fct_matched == 0:
         failures.append("no fact row joins to dim_game: game_id in events does not match the API catalog")
+    if health_duplicates != 0:
+        failures.append(f"v_pipeline_health reports {health_duplicates} duplicate rows (must be 0)")
     if game_revenue_rows == 0:
         failures.append("serving.v_game_revenue is empty")
     if dim_count == 0:
